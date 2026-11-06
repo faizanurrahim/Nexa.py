@@ -39,7 +39,7 @@ If the command displays the Nexa.py help menu, the installation was successful!
 Create a file named `app.py`:
 
 ```python
-from nexa import Nserver
+from Nexa import Nserver
 
 # Create your application
 app = Nserver("My First App")
@@ -70,7 +70,7 @@ Nexa.py supports template rendering through `render_template()`.
 Create a file named `app.py`:
 
 ```python
-from nexa import Nserver, render_template
+from Nexa import Nserver, render_template
 
 # Create your application
 app = Nserver("My First App")
