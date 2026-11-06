@@ -43,7 +43,7 @@ def get_env():
         sys.path.insert(0, cwd)
 
     try:
-        import .LIB.env as env
+        from .LIB import env
         return env.__env_setup__()
     except ModuleNotFoundError as exc:
         raise NexaError(
