@@ -10,7 +10,7 @@ class NexaError(Exception):
     """Base error class for Nexa.py."""
 
 
-__version__ = "0.0.1-ALPHA"
+__version__ = "0.1.0-ALPHA"
 def __err_fix__(CDE: str):
     """Get a fix for an error code."""
     fixes = {
