@@ -12,6 +12,11 @@ license = "MIT"
 dependencies = [
     "typer",
 ]
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "flake8"
+]
 
 [project.scripts]
 nexa = "Nexa.nexa:app"
