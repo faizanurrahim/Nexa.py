@@ -43,11 +43,11 @@ def get_env():
         sys.path.insert(0, cwd)
 
     try:
-        import LIB.env as env
+        import .LIB.env as env
         return env.__env_setup__()
     except ModuleNotFoundError as exc:
         raise NexaError(
-            f"CDE 1"
+            f"CDE Env.NEXA ERR"
         ) from exc
 
 
