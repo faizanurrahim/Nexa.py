@@ -3,7 +3,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "nexa"
+name = "Nexa.py"
 version = "0.1.0"
 description = "Nexa.py — a Python-based web framework and development platform"
 readme = "Nexa/prd.md"
@@ -12,11 +12,7 @@ license = "MIT"
 dependencies = [
     "typer",
 ]
-[project.optional-dependencies]
-dev = [
-    "pytest",
-    "flake8"
-]
+
 
 [project.scripts]
 nexa = "Nexa.nexa:app"
