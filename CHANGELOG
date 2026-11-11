@@ -1,0 +1,22 @@
+# Changelog
+
+## 0.5.0
+
+### Added
+
+- Added the `NXserver` public name with configurable host binding; the default
+  remains `127.0.0.1`.
+- Added Nexa Core event registration on an existing NXserver instance.
+- Added the `nexa exec` CLI command as an alias for executing Nexa scripts.
+
+### Changed
+
+- Updated documentation and examples to use NXserver as the official server
+  name.
+- Improved `NXscript` conditional parsing so nested `if` blocks work inside
+  outer `elif` and `else` branches.
+
+### Deprecated
+
+- Kept `Nserver` and the `Nexa.nserver` module as compatibility APIs; use
+  `NXserver` and `Nexa.nxserver` for new applications.
