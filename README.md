@@ -37,7 +37,6 @@ try:
 except Exception as exc: print(exc)
 ```
 
-Use `nexa exec main` to execute a script through Nexa's existing script runner. Package installation is handled separately by NOVA (`nova install package`).
 ---
 
 ## Quick Start
@@ -140,28 +139,3 @@ Explore more Nexa.py features and examples:
 
 [Read Concepts Documentation](concepts.md)
 
-## Core events
-
-Nexa Core registers browser-callable Python events on the same NXserver; it does not start a second HTTP server.
-
-```python
-from Nexa import Core, NXserver
-
-app = NXserver("My App")
-Core.init_app(app)
-
-@Core.event("hello")
-def hello(data):
-    return {"message": "Hello " + data.get("name", "Guest")}
-
-app.run()
-```
-
-Post `{"event": "hello", "data": {"name": "Nexa"}}` as JSON to `app.core_event_endpoint`. `Nserver` remains available as a deprecated compatibility name during migration.
-
-## Project boundaries
-
-- **NXserver** handles HTTP requests and responses.
-- **Nexa Core** registers browser/Python event routes on NXserver.
-- **NXLang** is a separate scripting-language concern; the Nexa CLI provides script execution.
-- **NOVA** owns package management and is not bundled into the Nexa HTTP server.
