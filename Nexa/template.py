@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 import re
-from typing import Any, TYPE_CHECKING
+from contextvars import ContextVar
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from .nxserver import NXserver, Response
@@ -197,35 +198,31 @@ class _PerRequestLoader:
 
 
 _default_loader = _PerRequestLoader()
-_current_loader: Any = _default_loader
+_current_loader: ContextVar[Any] = ContextVar("nexa_current_template_loader", default=None)
 
 
 def _bind_loader(app: "NXserver") -> None:
-    global _current_loader
-    _current_loader = _template_loader(app)
+    _current_loader.set(_template_loader(app))
 
 
 def _unbind_loader() -> None:
-    global _current_loader
-    _current_loader = _default_loader
+    _current_loader.set(None)
 
 
 def _auto_bind_loader() -> None:
     """Bind the loader automatically when an active NXserver exists."""
-    global _current_loader
-
-    if _current_loader is not _default_loader:
+    if _current_loader.get() is not None:
         return
 
     from .nxserver import _current_server
 
     server = _current_server.get()
     if server is not None:
-        _current_loader = _template_loader(server)
+        _current_loader.set(_template_loader(server))
 
 
 def _get_loader():
-    return _current_loader
+    return _current_loader.get() or _default_loader
 
 
 # ---------------------------------------------------------------------------

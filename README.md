@@ -54,8 +54,8 @@ app = NXserver("My First App")
 # Define your first route
 app.route("/")(lambda: "<h1>Hello, World!</h1>")
 
-# Run the application
-app.run()
+if __name__ == "__main__":
+    app.run()
 ```
 
 ### Run the Application
@@ -71,6 +71,36 @@ To select a host and port explicitly:
 ```python
 app = NXserver("My App", host="127.0.0.1", port=3000)
 ```
+
+### Use a WSGI server
+
+`app.run()` starts Nexa's built-in development server. To use a WSGI-compatible
+server, define the application object in an importable module and let the WSGI
+server import it. An `NXserver` instance is itself a WSGI application:
+
+```python
+from Nexa import NXserver
+
+app = NXserver("MyApplication")
+
+@app.get("/")
+def home():
+    return "Hello from Nexa!"
+
+if __name__ == "__main__":
+    app.run()
+```
+
+For example, after installing Waitress (`pip install waitress`), run this from
+the directory containing `app.py`:
+
+```bash
+waitress-serve --listen=127.0.0.1:8080 app:app
+```
+
+The final `app:app` is Waitress's normal `module:variable` syntax: import the
+`app` module and serve its `app` object. The `if __name__ == "__main__"` guard
+keeps the built-in server from starting when the module is imported.
 
 ---
 

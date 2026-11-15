@@ -12,6 +12,7 @@ import urllib.parse
 import warnings
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -20,7 +21,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 from .__json import JSONResponse
 from .__json import jsonify as _jsonify
 from .nx import Element, Fragment
-from .template import _bind_loader, _unbind_loader, install_template_hooks
+from .template import _unbind_loader, install_template_hooks
 from .template import render_template as _render_template
 from .template import rndr_template as _rndr_template
 
@@ -52,6 +53,8 @@ class Request:
         body_bytes: bytes,
         remote_addr: str,
         max_body_size: int,
+        server_name: str = "",
+        server_port: str = "",
     ) -> None:
         self._method = method
         self._path = path
@@ -61,6 +64,8 @@ class Request:
         self._body_bytes = body_bytes
         self._remote_addr = remote_addr
         self._max_body_size = max_body_size
+        self._server_name = server_name
+        self._server_port = server_port
 
         # Cached parsed values — computed lazily so we do not pay for them
         # when a handler never touches them.
@@ -165,6 +170,14 @@ class Request:
     @property
     def remote_addr(self) -> str:
         return self._remote_addr
+
+    @property
+    def server_name(self) -> str:
+        return self._server_name
+
+    @property
+    def server_port(self) -> str:
+        return self._server_port
 
     # -- internal helpers ------------------------------------------------------
 
@@ -540,8 +553,18 @@ class Response:
         else:
             body_bytes = str(self.body).encode("utf-8")
 
+        header_content_type = next(
+            (
+                value
+                for name, value in headers.items()
+                if name.lower() == "content-type"
+            ),
+            None,
+        )
         if self.content_type:
             content_type = self.content_type
+        elif header_content_type:
+            content_type = header_content_type
         elif body_bytes:
             content_type = "text/html; charset=utf-8"
         else:
@@ -963,6 +986,353 @@ class NXserver:
             return "/" + prefix
         return "/" + prefix + "/" + path
 
+    def __call__(self, environ: dict[str, Any], start_response: Callable) -> list[bytes]:
+        """Serve a WSGI request directly through this application instance."""
+        return self.wsgi_app(environ, start_response)
+
+    def wsgi_app(self, environ: dict[str, Any], start_response: Callable) -> list[bytes]:
+        """Handle one WSGI request and return an iterable containing bytes."""
+        req: Optional[Request] = None
+        try:
+            req = self._build_wsgi_request(environ)
+            body, status, headers = self._process_request(req)
+        except _RequestError as exc:
+            body, status, headers = self._error_response(
+                exc.status, exc.title, exc.detail
+            )
+
+        status_line = self._status_line(status)
+        start_response(status_line, headers)
+        return [b"" if req is not None and req.method == "HEAD" else body]
+
+    def _build_wsgi_request(self, environ: dict[str, Any]) -> Request:
+        method = environ.get("REQUEST_METHOD", "GET")
+        path = environ.get("PATH_INFO", "")
+        query_string = environ.get("QUERY_STRING", "")
+        if not isinstance(method, str) or not isinstance(path, str):
+            raise _RequestError(400, "Bad Request", "Invalid request method or path.")
+        if not isinstance(query_string, str):
+            raise _RequestError(400, "Bad Request", "Invalid query string.")
+
+        method = method.upper()
+        headers: dict[str, str] = {}
+        for key, value in environ.items():
+            if not isinstance(key, str) or not isinstance(value, str):
+                continue
+            if key.startswith("HTTP_"):
+                name = key[5:].replace("_", "-").title()
+                headers[name] = value
+        for key, name in (
+            ("CONTENT_TYPE", "Content-Type"),
+            ("CONTENT_LENGTH", "Content-Length"),
+        ):
+            value = environ.get(key)
+            if value is not None and not isinstance(value, str):
+                raise _RequestError(400, "Bad Request", f"Invalid {name} header.")
+            if value:
+                headers[name] = value
+
+        body_bytes = self._read_wsgi_body(environ, headers.get("Content-Length"))
+        server_name = environ.get("SERVER_NAME", "")
+        server_port = environ.get("SERVER_PORT", "")
+        url = f"{path}?{query_string}" if query_string else path
+        if not url and server_name:
+            url = f"{environ.get('wsgi.url_scheme', 'http')}://{server_name}"
+            if server_port:
+                url += f":{server_port}"
+        remote_addr = environ.get("REMOTE_ADDR", "")
+
+        return Request(
+            method=method,
+            path=path,
+            url=url,
+            query_string=query_string,
+            headers=headers,
+            body_bytes=body_bytes,
+            remote_addr=remote_addr if isinstance(remote_addr, str) else "",
+            max_body_size=self.max_body_size,
+            server_name=server_name if isinstance(server_name, str) else "",
+            server_port=server_port if isinstance(server_port, str) else "",
+        )
+
+    def _read_wsgi_body(
+        self, environ: dict[str, Any], content_length: Optional[str]
+    ) -> bytes:
+        if content_length is None or content_length == "":
+            length = None
+        elif (
+            not isinstance(content_length, str)
+            or not content_length.isascii()
+            or not content_length.isdigit()
+        ):
+            raise _RequestError(400, "Bad Request", "Invalid Content-Length header.")
+        else:
+            try:
+                length = int(content_length)
+            except ValueError as exc:
+                raise _RequestError(
+                    413,
+                    "Content Too Large",
+                    f"Request body exceeds the maximum allowed "
+                    f"({self.max_body_size} bytes).",
+                ) from exc
+            if length > self.max_body_size:
+                raise _RequestError(
+                    413,
+                    "Content Too Large",
+                    f"Request body size ({length} bytes) exceeds the "
+                    f"maximum allowed ({self.max_body_size} bytes).",
+                )
+
+        stream = environ.get("wsgi.input", io.BytesIO())
+        if not hasattr(stream, "read"):
+            raise _RequestError(400, "Bad Request", "Invalid WSGI request body stream.")
+
+        try:
+            if length is None:
+                chunks = bytearray()
+                while len(chunks) <= self.max_body_size:
+                    chunk = stream.read(self.max_body_size + 1 - len(chunks))
+                    if not isinstance(chunk, bytes):
+                        raise TypeError("wsgi.input must return bytes")
+                    if not chunk:
+                        return bytes(chunks)
+                    chunks.extend(chunk)
+                raise _RequestError(
+                    413,
+                    "Content Too Large",
+                    f"Request body size exceeds the maximum allowed "
+                    f"({self.max_body_size} bytes).",
+                )
+
+            chunks = bytearray()
+            while len(chunks) < length:
+                chunk = stream.read(length - len(chunks))
+                if not isinstance(chunk, bytes):
+                    raise TypeError("wsgi.input must return bytes")
+                if not chunk:
+                    raise _RequestError(
+                        400, "Bad Request", "Request body is shorter than Content-Length."
+                    )
+                chunks.extend(chunk)
+            return bytes(chunks)
+        except _RequestError:
+            raise
+        except Exception as exc:
+            raise _RequestError(
+                400, "Bad Request", f"Could not read request body: {exc}"
+            ) from exc
+
+    def _process_request(self, req: Request) -> tuple[bytes, int, list[tuple[str, str]]]:
+        req_token = _current_request.set(req)
+        server_token = _current_server.set(self)
+        try:
+            for hook in self._before_request_handlers:
+                try:
+                    hook(req)
+                except _RequestError as exc:
+                    return self._error_response(exc.status, exc.title, exc.detail)
+                except Exception:
+                    if self.debug:
+                        traceback.print_exc()
+                    return self._error_response(
+                        500,
+                        "Internal Server Error",
+                        "A before-request hook raised an error.",
+                    )
+
+            if req.method == "OPTIONS" and self.cors.is_origin_allowed(
+                req.headers.get("Origin")
+            ):
+                return self._options_response(req)
+
+            route, params = self.router.match(req.path)
+            if route is None:
+                any_route = self.router.route_for_path(req.path)
+                if any_route is not None:
+                    allowed = ", ".join(sorted(any_route.methods))
+                    return self._error_response(
+                        405,
+                        "Method Not Allowed",
+                        f"The method {req.method} is not allowed for this URL.",
+                        {"Allow": allowed},
+                    )
+                return self._error_response(
+                    404, "Not Found", f"No route registered for {req.path!r}."
+                )
+
+            if req.method not in route.methods:
+                allowed = ", ".join(sorted(route.methods))
+                return self._error_response(
+                    405,
+                    "Method Not Allowed",
+                    f"The method {req.method} is not allowed for this URL.",
+                    {"Allow": allowed},
+                )
+
+            try:
+                response = route.handler(**params) if route.param_names else route.handler()
+                body, content_type, status, headers = self._normalize_response(response)
+            except _RequestError as exc:
+                return self._error_response(exc.status, exc.title, exc.detail)
+            except Exception:
+                if self.debug:
+                    traceback.print_exc()
+                return self._error_response(
+                    500,
+                    "Internal Server Error",
+                    "An unexpected error occurred while handling the request.",
+                )
+
+            for hook in self._after_request_handlers:
+                try:
+                    result = hook(body, status, dict(headers))
+                    if len(result) == 4:
+                        body, content_type, status, headers = result
+                    elif len(result) == 3:
+                        body, status, headers = result
+                        content_type = next(
+                            (
+                                value
+                                for name, value in headers.items()
+                                if name.lower() == "content-type"
+                            ),
+                            content_type,
+                        )
+                    else:
+                        raise ValueError("after-request hooks must return a 3- or 4-item tuple")
+                    if not isinstance(headers, dict):
+                        raise TypeError("after-request hook headers must be a dict")
+                    if isinstance(body, str):
+                        body = body.encode("utf-8")
+                    elif not isinstance(body, bytes):
+                        body = str(body).encode("utf-8")
+                except Exception:
+                    if self.debug:
+                        traceback.print_exc()
+                    return self._error_response(
+                        500,
+                        "Internal Server Error",
+                        "An after-request hook raised an error.",
+                    )
+
+            try:
+                return self._prepare_response(body, content_type, status, headers)
+            except Exception:
+                if self.debug:
+                    traceback.print_exc()
+                return self._error_response(
+                    500,
+                    "Internal Server Error",
+                    "Could not construct the response.",
+                )
+        finally:
+            _unbind_loader()
+            _current_server.reset(server_token)
+            _current_request.reset(req_token)
+
+    def _normalize_response(
+        self, body: Any
+    ) -> tuple[bytes, str, int, dict[str, str]]:
+        extra_headers: dict[str, str] = {}
+        if isinstance(body, JSONResponse):
+            rendered = body.render()
+            return (
+                rendered.encode("utf-8"),
+                "application/json; charset=utf-8",
+                body.status,
+                extra_headers,
+            )
+        if isinstance(body, (Element, Fragment)):
+            return (
+                body.render().encode("utf-8"),
+                "text/html; charset=utf-8",
+                200,
+                extra_headers,
+            )
+        if isinstance(body, Response):
+            response_body, content_type, status, headers = body.render()
+            extra_headers.update(headers)
+            return response_body, content_type, status, extra_headers
+        if isinstance(body, bytes):
+            return body, "text/html; charset=utf-8", 200, extra_headers
+        if isinstance(body, str):
+            return body.encode("utf-8"), "text/html; charset=utf-8", 200, extra_headers
+        return str(body).encode("utf-8"), "text/html; charset=utf-8", 200, extra_headers
+
+    def _options_response(self, req: Request) -> tuple[bytes, int, list[tuple[str, str]]]:
+        origin = req.headers.get("Origin")
+        echoed = self.cors.echo_origin(origin)
+        headers = {
+            "Access-Control-Allow-Origin": echoed or "*",
+            "Access-Control-Allow-Methods": ", ".join(self.cors.allowed_methods),
+            "Access-Control-Allow-Headers": ", ".join(self.cors.allowed_headers),
+            "Access-Control-Max-Age": str(self.cors.max_age),
+            "Access-Control-Expose-Headers": ", ".join(self.cors.expose_headers) or "*",
+        }
+        if self.cors.allow_credentials:
+            headers["Access-Control-Allow-Credentials"] = "true"
+        return self._prepare_response(b"", "text/plain; charset=utf-8", 204, headers)
+
+    def _error_response(
+        self,
+        status: int,
+        title: str,
+        detail: str,
+        headers: Optional[dict[str, str]] = None,
+    ) -> tuple[bytes, int, list[tuple[str, str]]]:
+        body = json.dumps(
+            {"error": title, "detail": detail}, ensure_ascii=False
+        ).encode("utf-8")
+        return self._prepare_response(
+            body, "application/json; charset=utf-8", status, headers or {}
+        )
+
+    @staticmethod
+    def _status_line(status: int) -> str:
+        try:
+            phrase = HTTPStatus(status).phrase
+        except (ValueError, TypeError):
+            phrase = "Unknown"
+        return f"{status} {phrase}"
+
+    @staticmethod
+    def _prepare_response(
+        body: bytes,
+        content_type: str,
+        status: int,
+        extra_headers: dict[str, str],
+    ) -> tuple[bytes, int, list[tuple[str, str]]]:
+        status = int(status)
+        if not 100 <= status <= 599:
+            raise ValueError(f"Invalid HTTP status code {status}.")
+        if not isinstance(body, bytes):
+            body = str(body).encode("utf-8")
+
+        headers: list[tuple[str, str]] = [
+            ("Content-Type", str(content_type)),
+            ("X-Content-Type-Options", "nosniff"),
+        ]
+        seen = {"content-type", "x-content-type-options"}
+        for name, value in extra_headers.items():
+            lower_name = name.lower()
+            if lower_name in {"content-type", "content-length"}:
+                continue
+            if lower_name in seen:
+                headers = [
+                    (old_name, str(value) if old_name.lower() == lower_name else old_value)
+                    for old_name, old_value in headers
+                ]
+            else:
+                headers.append((name, str(value)))
+                seen.add(lower_name)
+
+        if status not in {204, 304} and not 100 <= status < 200:
+            headers.append(("Content-Length", str(len(body))))
+        else:
+            body = b""
+        return body, status, headers
+
     # -- running the server --------------------------------------------------
 
     def run(self):
@@ -978,15 +1348,23 @@ class NXserver:
                 status: int = 200,
                 headers: Optional[dict[str, str]] = None,
             ) -> None:
+                body, status, response_headers = server._prepare_response(
+                    body, content_type, status, headers or {}
+                )
+                self._send_prepared_response(body, status, response_headers)
+
+            def _send_prepared_response(
+                self,
+                body: bytes,
+                status: int,
+                headers: list[tuple[str, str]],
+            ) -> None:
                 self.send_response(status)
-                self.send_header("Content-Type", content_type)
-                self.send_header("Content-Length", str(len(body)))
-                self.send_header("X-Content-Type-Options", "nosniff")
-                if headers:
-                    for name, value in headers.items():
-                        self.send_header(name, value)
+                for name, value in headers:
+                    self.send_header(name, value)
                 self.end_headers()
-                self.wfile.write(body)
+                if self.command != "HEAD":
+                    self.wfile.write(body)
 
             def _send_json_error(
                 self, status: int, title: str, detail: str
@@ -1006,6 +1384,8 @@ class NXserver:
                 if content_length is None:
                     return b""
                 try:
+                    if not content_length.isascii() or not content_length.isdigit():
+                        raise ValueError
                     length = int(content_length)
                 except ValueError:
                     raise _RequestError(
@@ -1022,7 +1402,12 @@ class NXserver:
                     )
                 if length == 0:
                     return b""
-                return self.rfile.read(length)
+                body = self.rfile.read(length)
+                if len(body) != length:
+                    raise _RequestError(
+                        400, "Bad Request", "Request body is shorter than Content-Length."
+                    )
+                return body
 
             def _build_request(self) -> Request:
                 method = self.command
@@ -1035,20 +1420,18 @@ class NXserver:
                 for key, value in self.headers.items():
                     raw_headers[key] = value
 
-                body_bytes = b""
-                if method in {"POST", "PUT", "PATCH", "DELETE", "OPTIONS"}:
-                    try:
-                        body_bytes = self._read_body(server.max_body_size)
-                    except _RequestError:
-                        raise
-                    except Exception as exc:
-                        if server.debug:
-                            traceback.print_exc()
-                        raise _RequestError(
-                            400,
-                            "Bad Request",
-                            f"Could not read request body: {exc}",
-                        ) from exc
+                try:
+                    body_bytes = self._read_body(server.max_body_size)
+                except _RequestError:
+                    raise
+                except Exception as exc:
+                    if server.debug:
+                        traceback.print_exc()
+                    raise _RequestError(
+                        400,
+                        "Bad Request",
+                        f"Could not read request body: {exc}",
+                    ) from exc
 
                 remote_addr = self.client_address[0] if self.client_address else "127.0.0.1"
 
@@ -1061,211 +1444,19 @@ class NXserver:
                     body_bytes=body_bytes,
                     remote_addr=remote_addr,
                     max_body_size=server.max_body_size,
+                    server_name=str(self.server.server_address[0]),
+                    server_port=str(self.server.server_address[1]),
                 )
 
             def _handle_request(self) -> None:
-                req = self._build_request()
-
-                # Store the request and server in contextvars so route handlers
-                # can access them via ``nxserver.request`` and template rendering
-                # can find the correct server's template folder.
-                req_token = _current_request.set(req)
-                server_token = _current_server.set(server)
                 try:
-                    # Run before-request hooks.
-                    for hook in server._before_request_handlers:
-                        try:
-                            hook(req)
-                        except _RequestError as exc:
-                            self._send_json_error(exc.status, exc.title, exc.detail)
-                            return
-                        except Exception:
-                            if server.debug:
-                                traceback.print_exc()
-                            self._send_json_error(
-                                500, "Internal Server Error",
-                                "A before-request hook raised an error."
-                            )
-                            return
-
-                    # CORS preflight?
-                    if req.method == "OPTIONS" and server.cors.is_origin_allowed(
-                        req.headers.get("Origin")
-                    ):
-                        self._handle_options(req)
-                        return
-
-                    # Find a matching route.
-                    route, params = server.router.match(req.path)
-
-                    if route is None:
-                        # Check whether any route exists for this path (different method).
-                        any_route = server.router.route_for_path(req.path)
-                        if any_route is not None:
-                            allowed = ", ".join(sorted(any_route.methods))
-                            self._send_json_error(
-                                405,
-                                "Method Not Allowed",
-                                f"The method {req.method} is not allowed for this URL.",
-                            )
-                            self.send_header("Allow", allowed)
-                            self.end_headers()
-                            return
-                        self._send_json_error(
-                            404,
-                            "Not Found",
-                            f"No route registered for {req.path!r}.",
-                        )
-                        return
-
-                    # Method check.
-                    if req.method not in route.methods:
-                        allowed = ", ".join(sorted(route.methods))
-                        self._send_json_error(
-                            405,
-                            "Method Not Allowed",
-                            f"The method {req.method} is not allowed for this URL.",
-                        )
-                        # end_headers sends the Allow header on the same response.
-                        # We must call end_headers after _send_json_error already
-                        # called send_response + send_header + end_headers — so
-                        # instead rebuild the response with the Allow header.
-                        self._send_response(
-                            json.dumps(
-                                {"error": "Method Not Allowed",
-                                 "detail": f"The method {req.method} is not allowed for this URL."},
-                                ensure_ascii=False,
-                            ).encode("utf-8"),
-                            "application/json; charset=utf-8",
-                            405,
-                            {"Allow": allowed},
-                        )
-                        return
-
-                    # Call the handler with extracted path parameters.
-                    try:
-                        if route.param_names:
-                            response_body = route.handler(**params)
-                        else:
-                            response_body = route.handler()
-                    except _RequestError as exc:
-                        self._send_json_error(exc.status, exc.title, exc.detail)
-                        return
-                    except Exception:
-                        if server.debug:
-                            traceback.print_exc()
-                        self._send_json_error(
-                            500,
-                            "Internal Server Error",
-                            "An unexpected error occurred while handling the request.",
-                        )
-                        return
-
-                    # Normalize the response body into (bytes, content_type, status, extra_headers).
-                    body_bytes, content_type, status, extra_headers = self._normalize_response(
-                        response_body
+                    req = self._build_request()
+                    body, status, headers = server._process_request(req)
+                except _RequestError as exc:
+                    body, status, headers = server._error_response(
+                        exc.status, exc.title, exc.detail
                     )
-
-                    # After-request hooks.
-                    for hook in server._after_request_handlers:
-                        try:
-                            body_bytes, content_type, status, extra_headers = hook(
-                                body_bytes, status, dict(extra_headers)
-                            )
-                            if isinstance(body_bytes, str):
-                                body_bytes = body_bytes.encode("utf-8")
-                            if isinstance(body_bytes, bytes):
-                                pass
-                            else:
-                                body_bytes = str(body_bytes).encode("utf-8")
-                        except Exception:
-                            if server.debug:
-                                traceback.print_exc()
-                            self._send_json_error(
-                                500,
-                                "Internal Server Error",
-                                "An after-request hook raised an error.",
-                            )
-                            return
-
-                    self._send_response(body_bytes, content_type, status, extra_headers)
-
-                finally:
-                    _current_server.reset(server_token)
-                    _current_request.reset(req_token)
-
-            def _normalize_response(
-                self, body: Any
-            ) -> tuple[bytes, str, int, dict[str, str]]:
-                """Turn a handler return value into a response tuple."""
-                extra_headers: dict[str, str] = {}
-
-                # JSONResponse (from __json.jsonify or direct construction).
-                if isinstance(body, JSONResponse):
-                    try:
-                        rendered = body.render()
-                    except Exception as exc:
-                        if server.debug:
-                            traceback.print_exc()
-                        rendered = json.dumps(
-                            {"error": "Internal Server Error",
-                             "detail": "Failed to serialize JSON response."},
-                            ensure_ascii=False,
-                        )
-                    return (
-                        rendered.encode("utf-8"),
-                        "application/json; charset=utf-8",
-                        body.status,
-                        extra_headers,
-                    )
-
-                # Element / Fragment -> HTML.
-                if isinstance(body, (Element, Fragment)):
-                    return (
-                        body.render().encode("utf-8"),
-                        "text/html; charset=utf-8",
-                        200,
-                        extra_headers,
-                    )
-
-                # Response object.
-                if isinstance(body, Response):
-                    bc, ct, st, eh = body.render()
-                    extra_headers.update(eh)
-                    if isinstance(bc, bytes):
-                        return bc, ct, st, extra_headers
-                    if isinstance(bc, str):
-                        return bc.encode("utf-8"), ct, st, extra_headers
-                    return str(bc).encode("utf-8"), ct, st, extra_headers
-
-                # Strings / bytes.
-                if isinstance(body, bytes):
-                    return body, "text/html; charset=utf-8", 200, extra_headers
-                if isinstance(body, str):
-                    return body.encode("utf-8"), "text/html; charset=utf-8", 200, extra_headers
-
-                # Anything else -> string.
-                return str(body).encode("utf-8"), "text/html; charset=utf-8", 200, extra_headers
-
-            def _handle_options(self, req: Request) -> None:
-                origin = req.headers.get("Origin")
-                echoed = server.cors.echo_origin(origin)
-                allowed_methods = ", ".join(server.cors.allowed_methods)
-                allowed_headers = ", ".join(server.cors.allowed_headers)
-                expose = ", ".join(server.cors.expose_headers) or "*"
-
-                headers = {
-                    "Access-Control-Allow-Origin": echoed or "*",
-                    "Access-Control-Allow-Methods": allowed_methods,
-                    "Access-Control-Allow-Headers": allowed_headers,
-                    "Access-Control-Max-Age": str(server.cors.max_age),
-                    "Access-Control-Expose-Headers": expose,
-                }
-                if server.cors.allow_credentials:
-                    headers["Access-Control-Allow-Credentials"] = "true"
-
-                body = b""
-                self._send_response(body, "text/plain; charset=utf-8", 204, headers)
+                self._send_prepared_response(body, status, headers)
 
             # -- HTTP method dispatchers --------------------------------------
 
