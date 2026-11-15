@@ -1,24 +1,66 @@
+
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "Nexa.py"
-version = "0.5.0"
+version = "0.5.1"
 description = "Nexa.py — a Python-based web framework and development platform"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
-dependencies = [
-    "typer",
+license-files = ["LICENSE"]
+
+authors = [
+    { name = "Faizan ur Rahim" }
 ]
 
+keywords = [
+    "nexa",
+    "web-framework",
+    "python",
+    "development-platform",
+    "web-development",
+    "NXserver"
+]
+
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Internet :: WWW/HTTP",
+    "Topic :: Software Development :: Libraries :: Python Modules"
+]
+
+dependencies = [
+    "typer"
+]
+
+[project.urls]
+Homepage = "https://github.com/faizanurrahim/Nexa.py"
+Repository = "https://github.com/faizanurrahim/Nexa.py"
+Issues = "https://github.com/faizanurrahim/Nexa.py/issues"
+Changelog = "https://github.com/faizanurrahim/Nexa.py/commits/main"
 
 [project.scripts]
 nexa = "Nexa.nexa:app"
 
 [tool.setuptools]
-packages = ["Nexa", "Nexa.Core", "Nexa.LIB", "Nexa.NEXA"]
+packages = [
+    "Nexa",
+    "Nexa.Core",
+    "Nexa.LIB",
+    "Nexa.NEXA"
+]
+
+include-package-data = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
