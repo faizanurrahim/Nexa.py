@@ -1,6 +1,5 @@
 """Tests for Nexa.static module."""
 
-from pathlib import Path
 
 from Nexa.static import StaticFiles
 

@@ -16,8 +16,7 @@ from __future__ import annotations
 
 import re
 from html import escape
-from typing import Any, Callable, Optional, Union
-
+from typing import Any, Optional, Union
 
 # ---------------------------------------------------------------------------
 # ValidationError

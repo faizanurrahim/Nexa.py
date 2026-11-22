@@ -1,8 +1,8 @@
 # Nexa.py Basic Concepts
 
-> Version 0.6.0 adds a threaded HTTP server, ASGI support, environment and
-> configuration management, middleware, static file serving, centralized
-> logging, and CLI diagnostics (`nexa doctor`, `nexa info`).
+> Version 0.7.0 adds WebSocket support, Blade component templates, NXscript
+> inheritance and includes, template caching, DevTools dashboard, lifecycle
+> hooks, custom error handlers, and new CLI commands (`nexa dev`, `nexa routes`).
 
 
 # Concept 1: API Creation

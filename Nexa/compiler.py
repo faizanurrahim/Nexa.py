@@ -129,7 +129,7 @@ def parse_node(lines, index):
 
     if inline:
         tag = inline.group(1)
-        raw_attrs = opening.group(2).strip()
+        raw_attrs = inline.group(2).strip()
 
         # Remove the trailing slash from self-closing tags.
         if raw_attrs.endswith("/"):

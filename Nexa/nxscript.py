@@ -13,17 +13,13 @@ from __future__ import annotations
 
 import re
 from html import escape
-from pathlib import Path
 from typing import Any, Optional
 
 from .template import (
-    TemplateError,
-    TemplateSyntaxError,
-    TemplateRenderError,
     TemplateNotFound,
-    _TEMPLATE_VARIABLE,
+    TemplateRenderError,
+    TemplateSyntaxError,
 )
-
 
 # ---------------------------------------------------------------------------
 # Safe expression evaluator
@@ -928,7 +924,7 @@ def render_nxscript(
     Returns:
         Rendered HTML string.
     """
-    from .nxserver import _current_server, _current_request
+    from .nxserver import _current_server
 
     server = _current_server.get()
     if server is None:

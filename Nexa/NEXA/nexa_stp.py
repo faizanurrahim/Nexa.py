@@ -1,8 +1,8 @@
 
-from pathlib import Path
 import runpy
 import sys
 import tomllib
+from pathlib import Path
 
 
 class AbordErr(Exception):

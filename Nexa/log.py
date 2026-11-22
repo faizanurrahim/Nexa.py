@@ -18,12 +18,12 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import sys
 import traceback
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Any, Callable, Optional, Union
 
 # ---------------------------------------------------------------------------
 # Level constants
@@ -127,6 +127,9 @@ class NexaLog:
     ``"nexa"``.
     """
 
+    # Module-level subscriber list for DevTools log tail.
+    _ring_subscribers: list[Callable[[str, str], None]] = []
+
     def __init__(
         self,
         name: str = "nexa",
@@ -158,6 +161,10 @@ class NexaLog:
         self._file_handler: Optional[logging.Handler] = None
         self._stream_handler: Optional[logging.Handler] = None
         self._structured = False
+        self._ring_buffer: deque[tuple[float, str, str]] = deque(maxlen=500)
+        self._ring_enabled = False
+        self._ring_buffer: deque[tuple[float, str, str]] = deque(maxlen=500)
+        self._ring_enabled = False
 
         # Build a real logging.Logger under the hood.
         self._logger = logging.getLogger(name)
@@ -183,6 +190,43 @@ class NexaLog:
         self._stream_handler.setLevel(logging.DEBUG)
         self._stream_handler.setFormatter(self._formatter)
         self._logger.addHandler(self._stream_handler)
+
+    # ------------------------------------------------------------------
+    # Ring buffer (in-memory log tail for DevTools)
+    # ------------------------------------------------------------------
+
+    def enable_ring_buffer(self) -> None:
+        """Start capturing log lines into an in-memory ring buffer.
+
+        When enabled, recent log lines are available via :attr:`ring_buffer`
+        and are forwarded to any subscribers registered via
+        :meth:`subscribe_ring`.
+        """
+        self._ring_enabled = True
+
+    def disable_ring_buffer(self) -> None:
+        """Stop capturing log lines into the ring buffer."""
+        self._ring_enabled = False
+
+    def subscribe_ring(self, callback: Callable[[str, str], None]) -> None:
+        """Register a callback to receive every log line.
+
+        The callback receives ``(level_name, message)``.  Use this from
+        DevTools to populate the log-tail view.
+        """
+        NexaLog._ring_subscribers.append(callback)
+
+    def unsubscribe_ring(self, callback: Callable[[str, str], None]) -> None:
+        """Remove a previously registered ring subscriber."""
+        try:
+            NexaLog._ring_subscribers.remove(callback)
+        except ValueError:
+            pass
+
+    @property
+    def ring_buffer(self) -> deque[tuple[float, str, str]]:
+        """The captured log lines as ``(timestamp, level, message)`` tuples."""
+        return self._ring_buffer
 
     # ------------------------------------------------------------------
     # Configuration
@@ -288,6 +332,17 @@ class NexaLog:
                 self._logger.log(level, scrubbed, exc_info=exc_info)
             else:
                 self._logger.log(level, scrubbed)
+
+        # Ring buffer capture for DevTools log tail.
+        if self._ring_enabled:
+            ts = datetime.now(timezone.utc).timestamp()
+            level_name = _level_name(level)
+            self._ring_buffer.append((ts, level_name, scrubbed))
+            for cb in self._ring_subscribers:
+                try:
+                    cb(level_name, scrubbed)
+                except Exception:
+                    pass
 
     def trace(self, msg: str, *args: Any, **kwargs: Any) -> None:
         self._emit(LEVEL_TRACE, msg, *args, **kwargs)

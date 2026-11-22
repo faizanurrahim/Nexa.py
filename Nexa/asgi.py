@@ -14,7 +14,7 @@ Usage::
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Awaitable, Callable, Iterable, Optional, Union
+from typing import Any, Awaitable, Callable, Iterable
 
 # ASGI types.
 Scope = dict[str, Any]

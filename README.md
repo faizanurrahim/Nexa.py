@@ -171,6 +171,122 @@ Explore more Nexa.py features and examples:
 
 ---
 
+## Nexa.py 0.7.0
+
+Version 0.7.0 adds WebSocket support, Blade component templates, NXscript
+inheritance and includes, template caching, DevTools dashboard, lifecycle
+hooks, custom error handlers, and new CLI commands (`nexa dev`, `nexa routes`).
+
+### WebSocket Support
+
+The `Nexa.websocket` module provides a minimal stdlib-based WebSocket
+implementation. Register async WebSocket handlers with `NXserver.ws("/path")`
+and use `async for message in ws` to read messages.
+
+```python
+from Nexa import NXserver
+
+app = NXserver("ws-demo", port=3000)
+
+async def echo(ws):
+    async for message in ws:
+        await ws.send_text(f"echo: {message}")
+
+app.ws("/chat")(echo)
+app.run()
+```
+
+### Blade Components
+
+The `Nexa.blade` module adds a component model on top of the NXscript
+compiler. Define reusable components by subclassing `BladeNode` and
+providing a `template` string.
+
+```python
+from Nexa import NXserver
+from Nexa.blade import BladeNode, BladeCompiler, install_blade_loader
+
+app = NXserver("app")
+
+class Card(BladeNode):
+    template = """
+    <div class="card">
+        <h2>{title}</h2>
+        {children}
+    </div>
+    """
+    def __init__(self, title, *children, **attrs):
+        super().__init__(**attrs)
+        self.title = title
+        self.children = children
+
+compiler = BladeCompiler()
+install_blade_loader(app, compiler)
+
+@app.route("/")
+def home(request):
+    return Card("Hello", P("Welcome"))
+```
+
+### NXscript Inheritance and Includes
+
+Elements can extend base templates with the `extends` attribute:
+
+```html
+<div extends="base.nx">
+    <p>Content here</p>
+</div>
+```
+
+Templates can include other templates with `<include src="..."/>`.
+
+### DevTools Dashboard
+
+When `debug=True`, a hidden dashboard is available at `http://127.0.0.1:PORT/__nexa__/`.
+It shows routes, middleware, config, request log, error log, and a live log tail.
+Access requires the `X-DevTools-Token` header.
+
+```python
+app = NXserver("myapp", debug=True)
+app.debug_token = "dev"  # optional
+```
+
+### Lifecycle Hooks
+
+```python
+@app.on_startup
+def setup():
+    print("Server starting...")
+
+@app.on_shutdown
+def cleanup():
+    print("Server stopping...")
+```
+
+### Custom Error Handlers
+
+```python
+@app.error_handler(ValueError)
+def handle_value_error(request, exc):
+    return json(error=str(exc)), 400, {"Content-Type": "application/json"}
+```
+
+### CLI Commands
+
+```bash
+# Start dev server with auto-reload
+nexa dev
+
+# List all registered routes
+nexa routes
+```
+
+### Log Tail
+
+The `Nexa.log` module now supports an in-memory ring buffer for DevTools log tailing.
+
+---
+
 ## Nexa.py 0.6.0
 
 Version 0.6.0 adds a threaded HTTP server, ASGI support, environment and

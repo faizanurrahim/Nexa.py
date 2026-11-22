@@ -17,12 +17,9 @@ from __future__ import annotations
 import datetime
 import hashlib
 import mimetypes
-import os
-import time
-from email.utils import formatdate, parsedate_to_datetime
 from email.utils import formatdate
 from pathlib import Path
-from typing import Any, Optional, Tuple
+from typing import Any, Optional, Tuple, Union
 
 # ---------------------------------------------------------------------------
 # MIME types

@@ -1,27 +1,28 @@
 from __future__ import annotations
 
+import asyncio
 import errno
 import io
 import ipaddress
 import json
-import mimetypes
 import operator
-import os
 import traceback
 import urllib.parse
 import warnings
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer as HTTPServer
+from http.server import BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer as HTTPServer
 from pathlib import Path
 from typing import Any, Callable, Optional
 from urllib.parse import parse_qs, unquote, urlparse
 
 from .__json import JSONResponse
 from .__json import jsonify as _jsonify
+from .log import _get_default as _get_default_logger
 from .nx import Element, Fragment
-from .template import _unbind_loader, install_template_hooks
+from .template import _unbind_loader, install_template_hooks  # noqa: F401 (re-exported by nserver.py)
 from .template import render_template as _render_template
 from .template import rndr_template as _rndr_template
 
@@ -29,6 +30,26 @@ from .template import rndr_template as _rndr_template
 # ``render_template`` without importing from Nexa.template directly.
 render_template = _render_template
 rndr_template = _rndr_template
+
+# Lazy import of websocket module to avoid circular imports at load time.
+_websocket_mod = None
+_devtools_mod = None
+
+def _get_websocket() -> Any:
+    """Return the websocket module, importing it on first use."""
+    global _websocket_mod
+    if _websocket_mod is None:
+        from . import websocket as _ws
+        _websocket_mod = _ws
+    return _websocket_mod
+
+def _get_devtools() -> Any:
+    """Return the devtools module, importing it on first use."""
+    global _devtools_mod
+    if _devtools_mod is None:
+        from . import devtools as _dt
+        _devtools_mod = _dt
+    return _devtools_mod
 
 
 # ---------------------------------------------------------------------------
@@ -629,6 +650,7 @@ class _Route:
     handler: Callable
     methods: set[str] = field(default_factory=lambda: {"GET", "HEAD"})
     param_names: list[str] = field(default_factory=list)
+    original_path: str = ""
 
 
 class Router:
@@ -643,6 +665,9 @@ class Router:
     def __init__(self) -> None:
         self._static: dict[str, _Route] = {}
         self._params: list[_Route] = []
+        # Aliases for the DevTools property on NXserver.
+        self._static_routes = self._static
+        self._param_routes = self._params
 
     def add(
         self,
@@ -664,6 +689,7 @@ class Router:
             method_set.add("HEAD")
 
         route = self._build_route(path, handler, method_set)
+        route._original_path = path
         if self._is_param_path(path):
             self._params.append(route)
         else:
@@ -692,7 +718,7 @@ class Router:
         pattern = "/" + "/".join(
             f"<{i}>" if s is None else s for i, s in enumerate(segments)
         )
-        return _Route(pattern=pattern, handler=handler, methods=methods, param_names=param_names)
+        return _Route(pattern=pattern, handler=handler, methods=methods, param_names=param_names, original_path=path)
 
     def _is_param_path(self, path: str) -> bool:
         return "<" in path
@@ -855,6 +881,12 @@ class NXserver:
         self._before_request_handlers: list[Callable[[Request], None]] = []
         self._after_request_handlers: list[Callable[[Any, int, dict[str, str]], Any]] = []
         self._blueprints: list[Any] = []
+        self._startup_handlers: list[Callable[[], None]] = []
+        self._shutdown_handlers: list[Callable[[], None]] = []
+        self._error_handlers: dict[type[BaseException], Callable[[Request, BaseException], tuple[bytes, int, dict[str, str]]]] = {}
+        self._ws_handlers: dict[str, Callable] = {}
+        self._devtools: Optional["DevTools"] = None  # noqa: F821 (lazy import)
+        self._mount: Optional["DevTools._DevToolsMount"] = None  # noqa: F821 (lazy import)
 
         project_dir = Path.cwd().resolve()
         self.project_dir = project_dir
@@ -892,6 +924,30 @@ class NXserver:
         def decorator(handler: Callable):
             self.router.add(path, handler, method_set)
             return handler
+
+        return decorator
+
+    def ws(self, path: str):
+        """Register an async WebSocket handler for *path*.
+
+        The handler receives a :class:`~Nexa.websocket.WebSocket` and can use
+        ``async for message in ws:`` to read messages and
+``ws.send_text(...)`` / ``ws.send_bytes(...)`` / ``ws.close(...)`` to send
+        data.  The connection is upgraded only when the client sends a proper
+        ``Sec-WebSocket-Key`` header.
+
+        Example::
+
+            async def echo(ws):
+                async for message in ws:
+                    await ws.send_text(f"echo: {message}")
+
+            server.ws("/chat")(echo)
+        """
+        def decorator(ws_handler):
+            self._ws_handlers[path] = ws_handler
+            return ws_handler
+        return decorator
 
         return decorator
 
@@ -938,7 +994,88 @@ class NXserver:
         self._after_request_handlers.append(handler)
         return handler
 
-    def register_blueprint(self, blueprint: "Blueprint") -> None:
+    def on_startup(self, handler: Callable[[], None]):
+        """Register a hook that runs once when the server starts accepting
+        connections.
+
+        Startup hooks run in registration order after the server socket is
+        bound but before the first request is served.
+        """
+        self._startup_handlers.append(handler)
+        return handler
+
+    def on_shutdown(self, handler: Callable[[], None]):
+        """Register a hook that runs once when the server stops accepting
+        connections.
+
+        Shutdown hooks run in registration order after ``serve_forever()``
+        returns (for example on ``KeyboardInterrupt``) but before the server
+        socket is closed.
+        """
+        self._shutdown_handlers.append(handler)
+        return handler
+
+    def error_handler(
+        self, exc_type: type[BaseException]
+    ) -> Callable[
+        [Callable[[Request, BaseException], tuple[bytes, int, dict[str, str]]]],
+        Callable[[Request, BaseException], tuple[bytes, int, dict[str, str]]],
+    ]:
+        """Register a custom error handler for *exc_type*.
+
+        Usage::
+
+            @server.error_handler(ValueError)
+            def handle_value_error(request, exc):
+                return b'{"error":"bad value"}', 400, {}
+
+        When a route or hook raises an exception of the given type, the
+        handler is called with the current request and the exception and must
+        return ``(body_bytes, status, headers_dict)``.
+
+        Handlers are matched most-specific-first (subclass before base class).
+        """
+
+        def decorator(
+            handler: Callable[[Request, BaseException], tuple[bytes, int, dict[str, str]]],
+        ) -> Callable[[Request, BaseException], tuple[bytes, int, dict[str, str]]]:
+            self._error_handlers[exc_type] = handler
+            return handler
+
+        return decorator
+
+    @property
+    def registered_routes(self) -> list[tuple[str, list[str], str]]:
+        """Return a list of ``(path, methods, handler_name)`` for all
+        registered routes.
+
+        This is used by the DevTools route inspector and the ``nexa routes``
+        CLI command.
+        """
+        rows: list[tuple[str, list[str], str]] = []
+        for path, route in self._static_routes.items():
+            rows.append((path, sorted(route.methods), route.handler.__name__ if hasattr(route.handler, "__name__") else str(route.handler)))
+        for route in self._param_routes:
+            rows.append((route._original_path, sorted(route.methods), route.handler.__name__ if hasattr(route.handler, "__name__") else str(route.handler)))
+        return rows
+
+    @property
+    def registered_middleware(self) -> list[tuple[str, int]]:
+        """Return a list of ``(name, priority)`` for currently registered
+        middleware, in the order they will be applied.
+
+        This is used by the DevTools middleware inspector.
+        """
+        try:
+            from .middleware import Middleware
+            return [
+                (m.name or "unnamed", m.priority)
+                for m in Middleware._middlewares
+            ]
+        except Exception:
+            return []
+
+    def register_blueprint(self, blueprint: "Blueprint") -> None:  # noqa: F821
         """Register a :class:`Blueprint` on this server.
 
         All routes defined on the blueprint are registered with their paths
@@ -1127,6 +1264,14 @@ class NXserver:
         req_token = _current_request.set(req)
         server_token = _current_server.set(self)
         try:
+            # DevTools hidden mount — only active when debug=True.
+            if self.debug:
+                _get_devtools()  # trigger lazy import side-effect
+                dt = self._devtools
+                if dt is not None and req.path.startswith("/__nexa__"):
+                    body, status, headers = dt._mount.dispatch(req)
+                    return self._prepare_response(body, headers.get("Content-Type", "text/html; charset=utf-8"), status, headers)
+
             for hook in self._before_request_handlers:
                 try:
                     hook(req)
@@ -1175,7 +1320,10 @@ class NXserver:
                 body, content_type, status, headers = self._normalize_response(response)
             except _RequestError as exc:
                 return self._error_response(exc.status, exc.title, exc.detail)
-            except Exception:
+            except Exception as exc:
+                handler = self._find_error_handler(type(exc))
+                if handler is not None:
+                    return handler(req, exc)
                 if self.debug:
                     traceback.print_exc()
                 return self._error_response(
@@ -1231,6 +1379,17 @@ class NXserver:
             _current_server.reset(server_token)
             _current_request.reset(req_token)
 
+    def _find_error_handler(self, exc_type: type[BaseException]) -> Optional[Callable[[Request, BaseException], tuple[bytes, int, dict[str, str]]]]:
+        """Return the most-specific registered error handler for *exc_type*."""
+        # Walk the MRO (excluding object) to find the most specific handler.
+        for cls in exc_type.__mro__:
+            if cls is object:
+                break
+            handler = self._error_handlers.get(cls)
+            if handler is not None:
+                return handler
+        return None
+
     def _normalize_response(
         self, body: Any
     ) -> tuple[bytes, str, int, dict[str, str]]:
@@ -1280,10 +1439,16 @@ class NXserver:
         title: str,
         detail: str,
         headers: Optional[dict[str, str]] = None,
+        *,
+        traceback_info: Optional[str] = None,
     ) -> tuple[bytes, int, list[tuple[str, str]]]:
-        body = json.dumps(
-            {"error": title, "detail": detail}, ensure_ascii=False
-        ).encode("utf-8")
+        payload: dict[str, Any] = {
+            "error": title,
+            "detail": detail,
+        }
+        if traceback_info is not None and self.debug:
+            payload["traceback"] = traceback_info
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         return self._prepare_response(
             body, "application/json; charset=utf-8", status, headers or {}
         )
@@ -1379,6 +1544,17 @@ class NXserver:
                     status,
                 )
 
+            def _http_response_only(
+                self,
+                status: int,
+                headers: dict[str, str],
+            ) -> None:
+                """Send a raw HTTP response with no body (used for 101 upgrades)."""
+                self.send_response(status)
+                for name, value in headers.items():
+                    self.send_header(name, value)
+                self.end_headers()
+
             def _read_body(self, max_size: int) -> bytes:
                 content_length = self.headers.get("Content-Length")
                 if content_length is None:
@@ -1458,9 +1634,41 @@ class NXserver:
                     )
                 self._send_prepared_response(body, status, headers)
 
+            def _try_websocket_upgrade(self) -> bool:
+                """If this GET request is a WebSocket upgrade for a registered ws route, handle it."""
+                if self.command != "GET":
+                    return False
+                upgrade = self.headers.get("Upgrade", "").lower()
+                if upgrade != "websocket":
+                    return False
+                parsed = urlparse(self.path)
+                path = unquote(parsed.path)
+                ws_handler = server._ws_handlers.get(path)
+                if ws_handler is None:
+                    return False
+                # Perform the upgrade; delegate to a daemon thread since the
+                # handshake + frame loop must run concurrently with the HTTP
+                # server's accept loop.
+                ws_mod = _get_websocket()
+                wss = ws_mod.WebSocketServer(server)
+                try:
+                    import threading
+                    threading.Thread(
+                        target=lambda: asyncio.run(
+                            wss.handle(self, ws_handler)
+                        ),
+                        daemon=True,
+                    ).start()
+                except Exception:
+                    if server.debug:
+                        traceback.print_exc()
+                return True
+
             # -- HTTP method dispatchers --------------------------------------
 
             def do_GET(self):
+                if self._try_websocket_upgrade():
+                    return
                 self._handle_request()
 
             def do_HEAD(self):
@@ -1483,6 +1691,16 @@ class NXserver:
 
             def log_message(self, fmt, *args):
                 print(f"[{server.name}] {fmt % args}")
+
+        # Set up DevTools if debug mode is enabled.
+        if self.debug:
+            dt_mod = _get_devtools()
+            self._devtools = dt_mod.DevTools(self)
+            self._mount = dt_mod._DevToolsMount(self._devtools)
+            # Subscribe DevTools to the default log ring buffer.
+            _default_logger = _get_default_logger()
+            _default_logger.enable_ring_buffer()
+            _default_logger.subscribe_ring(self._devtools.enqueue_log)
 
         try:
             httpd = HTTPServer((self.host, self.port), Handler)
@@ -1514,11 +1732,27 @@ class NXserver:
         # forever and exhaust the thread pool under load.
         httpd.timeout = 30.0
 
+        # Run startup hooks once the socket is bound.
+        for hook in self._startup_handlers:
+            try:
+                hook()
+            except Exception:
+                if self.debug:
+                    traceback.print_exc()
+                raise
+
         try:
             httpd.serve_forever()
         except KeyboardInterrupt:
             print("\nStopping Nexa server...")
         finally:
+            # Run shutdown hooks before closing the socket.
+            for hook in self._shutdown_handlers:
+                try:
+                    hook()
+                except Exception:
+                    if self.debug:
+                        traceback.print_exc()
             httpd.server_close()
 
 

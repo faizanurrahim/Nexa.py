@@ -1,30 +1,19 @@
 """Tests for Nexa.log module."""
 
 import json
-import logging
-import os
-import re
-import tempfile
-from pathlib import Path
 
 import pytest
 
 from Nexa.log import (
-    NexaLog,
-    get_logger,
-    info,
-    debug,
-    warn,
-    error,
-    fatal,
-    request,
-    exception,
-    LEVEL_TRACE,
     LEVEL_DEBUG,
-    LEVEL_INFO,
-    LEVEL_WARN,
     LEVEL_ERROR,
     LEVEL_FATAL,
+    LEVEL_INFO,
+    LEVEL_TRACE,
+    LEVEL_WARN,
+    NexaLog,
+    get_logger,
+    request,
 )
 
 

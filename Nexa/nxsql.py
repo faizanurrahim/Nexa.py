@@ -31,7 +31,6 @@ import sqlite3
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping, Sequence
 
-
 # -----------------------------
 # SQL expressions / safe helpers
 # -----------------------------

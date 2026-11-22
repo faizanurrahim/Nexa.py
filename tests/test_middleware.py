@@ -77,38 +77,6 @@ class TestMiddlewareBasics:
             "third-after", "second-after", "first-after",
         ]
 
-    def test_middleware_order_is_deterministic(self):
-        mware = Middleware()
-        order_log = []
-
-        def third(request, call_next):
-            order_log.append("third-before")
-            result = call_next(request)
-            order_log.append("third-after")
-            return result
-
-        def first(request, call_next):
-            order_log.append("first-before")
-            result = call_next(request)
-            order_log.append("first-after")
-            return result
-
-        def second(request, call_next):
-            order_log.append("second-before")
-            result = call_next(request)
-            order_log.append("second-after")
-            return result
-
-        mware.add(first, priority=10)
-        mware.add(second, priority=20)
-        mware.add(third, priority=30)
-        composed = mware.compose(handler)
-        composed({"path": "/"})
-        assert order_log == [
-            "first-before", "second-before", "third-before",
-            "third-after", "second-after", "first-after",
-        ]
-
 
 class TestMiddlewareAsync:
     """Async middleware support."""

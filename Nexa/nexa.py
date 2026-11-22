@@ -1,6 +1,7 @@
 
 from __future__ import annotations
 
+import multiprocessing
 import sys
 from pathlib import Path
 from typing import Optional
@@ -12,7 +13,7 @@ class NexaError(Exception):
     """Base error class for Nexa.py."""
 
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 
 
 app = typer.Typer(
@@ -35,7 +36,7 @@ def get_env():
         return Env().dump()
     except ModuleNotFoundError as exc:
         raise NexaError(
-            f"CDE Env.NEXA ERR"
+            "CDE Env.NEXA ERR"
         ) from exc
 
 
@@ -224,6 +225,134 @@ def _execute_script(script: str, noenv: bool) -> None:
     except KeyboardInterrupt:
         typer.echo("\nNexa execution interrupted.", err=True)
         raise typer.Exit(code=130)
+
+
+@app.command("dev")
+def dev(
+    port: int = typer.Option(3000, "--port", "-p", help="Port to listen on."),
+    host: str = typer.Option("127.0.0.1", "--host", "-H", help="Host to bind to."),
+    reload: bool = typer.Option(
+        True,
+        "--reload/--no-reload",
+        help="Watch for file changes and restart the server.",
+    ),
+    debug_token: Optional[str] = typer.Option(
+        None,
+        "--devtools-token",
+        help="Token for the DevTools dashboard. If not set, a random token is generated.",
+    ),
+):
+    """Start the Nexa development server with auto-reload.
+
+    The server runs in debug mode with the DevTools dashboard enabled.
+    When --reload is active (the default), the server watches for file
+    changes and restarts automatically.
+    """
+    from Nexa import NXserver
+
+    app_server = NXserver("dev", debug=True, port=port, host=host)
+
+    if debug_token is not None:
+        app_server.devtools.token = debug_token
+
+    print(f"\nDevTools token: {app_server.devtools.token}")
+    print(f"DevTools dashboard: http://{host}:{port}/__nexa__/\n")
+
+    if reload:
+        import multiprocessing
+
+        import watchfiles
+
+        def _run_server() -> None:
+            try:
+                app_server.run()
+            except KeyboardInterrupt:
+                pass
+
+        ctx = multiprocessing.get_context("spawn")
+        proc = ctx.Process(target=_run_server, daemon=True)
+        proc.start()
+
+        try:
+            watchfiles.watch(
+                str(Path.cwd()),
+                watch_filter=watchfiles.PythonFilter(),
+                debounce=300,
+                on_iter=lambda change_queue: _reload_on_changes(change_queue, proc, _run_server),
+            )
+        except KeyboardInterrupt:
+            proc.terminate()
+            proc.join(timeout=5)
+            print("\nServer stopped.")
+    else:
+        try:
+            app_server.run()
+        except KeyboardInterrupt:
+            print("\nServer stopped.")
+
+
+def _reload_on_changes(change_queue, proc, run_server_fn) -> None:
+    """Reload the server when Python files change."""
+    changes = list(change_queue)
+    if changes:
+        print(f"\nChanges detected in: {[str(c[0]) for c in changes]}")
+        print("Restarting server...\n")
+        proc.terminate()
+        proc.join(timeout=5)
+        ctx = multiprocessing.get_context("spawn")
+        new_proc = ctx.Process(target=run_server_fn, daemon=True)
+        new_proc.start()
+        return new_proc
+
+
+@app.command("routes")
+def list_routes(script: str = typer.Argument(
+    ...,
+    help="Script alias or filename to load before listing routes.",
+)):
+    """Load a script and print its registered routes."""
+    from Nexa import NXserver
+
+    try:
+        # Execute the script to register its routes.
+        _execute_script(script, noenv=False)
+    except Exception as exc:
+        typer.echo(f"Failed to load script: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    # Find the server instance that was created by the script.
+    # We look through all NXserver instances that have been created.
+    # For simplicity, we assume the script created exactly one server.
+    # A more robust approach would require the script to expose its server.
+    typer.echo("\nRegistered routes:")
+    typer.echo("-" * 60)
+
+    # Try to get routes from the most recently created server.
+    # This is a heuristic; production use should expose the server explicitly.
+    import gc
+    servers = []
+    for obj in gc.get_objects():
+        if isinstance(obj, NXserver):
+            servers.append(obj)
+
+    if not servers:
+        typer.echo("No server found. Make sure your script creates an NXserver.")
+        raise typer.Exit(code=1)
+
+    server = servers[-1]  # most recently created
+
+    if not server.registered_routes:
+        typer.echo("No routes registered.")
+        return
+
+    for path, methods, handler_name in server.registered_routes:
+        typer.echo(f"  {path:<40} {','.join(methods):<12} {handler_name}")
+
+    if server.registered_middleware:
+        typer.echo("\nMiddleware:")
+        typer.echo("-" * 60)
+        for name, priority in server.registered_middleware:
+            typer.echo(f"  {name:<40} priority={priority}")
 
 
 if __name__ == "__main__":

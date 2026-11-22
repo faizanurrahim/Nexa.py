@@ -1,12 +1,10 @@
 """Tests for Nexa.asgi module."""
 
 import asyncio
-from types import SimpleNamespace
 
 import pytest
 
 import Nexa
-
 from Nexa.asgi import ASGIAdaptor, ASGIError
 
 
