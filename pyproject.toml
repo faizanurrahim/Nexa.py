@@ -9,7 +9,7 @@ version = "0.6.0"
 description = "Nexa.py — a Python-based web framework and development platform"
 readme = "README.md"
 requires-python = ">=3.11"
-license = "MIT"
+license = "Apache-2.0"
 license-files = ["LICENSE"]
 
 authors = [
