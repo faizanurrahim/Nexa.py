@@ -1,8 +1,9 @@
 
 try:
-    from .nexa import app
+    from .nexa import app, __version__
 except ImportError:
     app = None  # typer not installed
+    __version__ = "1.0.0"
 from .asgi import ASGIAdaptor, ASGIServer
 from .blade import BladeCompiler, BladeNode, install_blade_loader
 from .blueprint import Blueprint
@@ -49,7 +50,9 @@ from .nforms import (
     ValidationError,
 )
 from .nx import App, Element, Fragment
-from .nxserver import Nserver, NXserver, jsonify, render_template, request
+from .nxlang import ERR as NXLangERR
+from .nxlang import NXLang
+from .nxserver import Nserver, NXserver, jsonify, render_template, request, redirect, Session, Response, HTMLResponse, TextResponse, text, html, CorsConfig
 from .static import StaticFiles
 from .websocket import WebSocket, WebSocketServer
 
@@ -119,10 +122,20 @@ __all__ = [
     "fatal",
     "log_request",
     "log_exception",
+    "CorsConfig",
     "BladeCompiler",
     "BladeNode",
     "install_blade_loader",
     "DevTools",
     "WebSocket",
     "WebSocketServer",
+    "redirect",
+    "Session",
+    "Response",
+    "HTMLResponse",
+    "TextResponse",
+    "text",
+    "html",
+    "NXLang",
+    "NXLangERR",
 ]

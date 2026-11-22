@@ -171,6 +171,132 @@ Explore more Nexa.py features and examples:
 
 ---
 
+## Nexa.py 0.9.1
+
+Version 0.9.1 redesigns the development workflow around your application's own
+`NXserver` instance.
+
+### Development server
+
+```bash
+nexa dev demo.py
+```
+
+`nexa dev` loads the application file, finds its `NXserver`, enables DevTools on
+that instance (you do not need `debug=True` or any startup code), prints the
+dashboard URL and token, and starts the server:
+
+```text
+Nexa.py Development Server
+
+Application: demo.py
+Server: http://127.0.0.1:3000
+DevTools: http://127.0.0.1:3000/__nexa__/
+
+DevTools token: <generated-token>
+
+Starting development server...
+```
+
+Options:
+
+- `--host`, `--port` — override the address configured in the application.
+- `--app NAME` — choose the server variable when the file defines several.
+- `--devtools-token TOKEN` — use a fixed token instead of a generated one.
+- `--reload` / `--no-reload` — automatic reload is **on** by default.
+
+### Application discovery
+
+1. An explicit `--app NAME` always wins.
+2. Otherwise the only `NXserver` instance in the file is used, whatever it is called.
+3. If the file defines more than one, `--app NAME` is required; the CLI lists
+   the candidates and exits.
+4. No instance produces a clear error.
+
+Conventional names (`app`, `application`, `server`, `nexa_app`, `app_server`)
+are recommended, but the CLI never guesses between multiple instances.
+
+`if __name__ == "__main__":` guards do not run during discovery, so the server
+is not started twice.
+
+### Reload
+
+Reload starts the application in a `python -m Nexa.devworker` subprocess and
+restarts it when Python files change. This works on Windows (no `multiprocessing`
+pickling of nested functions), ignores caches, virtualenvs, build output and
+non-Python files, and passes the same DevTools token to each restart.
+
+`watchfiles` is optional — install it with `python -m pip install watchfiles`.
+Without it, reload prints instructions and exits with code 1; `--no-reload`
+still works.
+
+### `nexa run serve` vs `nexa dev demo.py`
+
+`nexa run serve` executes a Nexa script or target. `nexa dev demo.py` is the
+development workflow for a plain Python application file: it discovers the
+application's server and manages its DevTools lifecycle.
+
+## Nexa.py 0.9.0
+
+Version 0.9.0 stabilises typed routing and DevTools, and introduces
+**NXLang Base** — the foundation of Nexa.py's language subsystem.
+
+### DevTools 2.0
+
+Open `http://127.0.0.1:3000/__nexa__/` while running `nexa dev`. The dashboard
+now has a sign-in page: paste the printed DevTools token once and the browser
+receives an `HttpOnly`, `SameSite=Strict` session cookie (8-hour expiry, `Secure`
+over HTTPS). Sessions are rotated on every login, `POST /__nexa__/logout`
+invalidates them, and DevTools refuses non-local clients. Programmatic clients
+can keep sending the `X-DevTools-Token` header.
+
+### Typed routing
+
+```python
+@app.get("/users/<int:user_id>", name="user")
+def user(user_id):
+    return jsonify({"id": user_id})
+
+@app.get("/files/<path:filename>")
+def files(filename):
+    return jsonify({"filename": filename})
+
+app.url_for("user", user_id=42)  # '/users/42'
+```
+
+Supported converters: `string`, `int`, `float`, `uuid`, `path`. Invalid values
+produce a normal 404, and URL generation percent-encodes parameters.
+
+### NXLang Base
+
+```nx
+include <base_compiler> as bc
+include <<_request_handler>> as rh
+
+do {
+    throw(ERR("Something went wrong"))
+}
+unless ERR as e {
+    print(e)
+}
+```
+
+Run it with:
+
+```bash
+nexa exec main
+```
+
+**Implemented in 0.9.0:** lexer, parser, AST, compiler front end, native `nx`
+runtime, `include <module>` / `include <<internal_module>>` resolution, the
+`do { } unless ERR as e { }` error-handling model with inheritance matching,
+the `ERR` error hierarchy, and `nexa exec`.
+
+**Planned, not implemented yet:** expressions beyond literals and calls,
+user-defined functions, control flow, standard library modules, and the `py`
+environment. `nexa run`, `nexa dev`, `nexa routes`, `nexa doctor`, and
+`nexa info` are unchanged.
+
 ## Nexa.py 0.7.0
 
 Version 0.7.0 adds WebSocket support, Blade component templates, NXscript

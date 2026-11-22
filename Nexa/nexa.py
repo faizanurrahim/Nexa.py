@@ -1,7 +1,6 @@
 
 from __future__ import annotations
 
-import multiprocessing
 import sys
 from pathlib import Path
 from typing import Optional
@@ -13,7 +12,7 @@ class NexaError(Exception):
     """Base error class for Nexa.py."""
 
 
-__version__ = "0.7.0"
+__version__ = "1.0.0"
 
 
 app = typer.Typer(
@@ -196,7 +195,11 @@ def run(
 def exec_script(
     script: str = typer.Argument(
         ...,
-        help="Script alias or filename, e.g. main.",
+        help="NXLang file (main, main.nx) or Nexa script alias.",
+    ),
+    args: list[str] = typer.Argument(
+        None,
+        help="Arguments passed to the NXLang program.",
     ),
     noenv: bool = typer.Option(
         False,
@@ -204,8 +207,46 @@ def exec_script(
         help="Skip Nexa environment initialization.",
     ),
 ):
-    """Execute a standalone Nexa script."""
+    """Execute an NXLang source file or a standalone Nexa script."""
+    if _execute_nxlang(script, list(args or [])):
+        return
     _execute_script(script, noenv)
+
+
+def _resolve_nxlang_path(script: str) -> Optional[Path]:
+    """Return the ``.nx`` file for *script*, or ``None`` if it is not NXLang."""
+    path = Path(script)
+    if path.suffix == ".nx":
+        return path if path.is_file() else None
+    candidate = path.with_suffix(".nx")
+    return candidate if candidate.is_file() else None
+
+
+def _execute_nxlang(script: str, args: list[str]) -> bool:
+    """Run *script* through NXLang when it names an ``.nx`` file.
+
+    Returns ``True`` when the script was executed as NXLang source and
+    ``False`` when the caller should use the legacy script runner.
+    """
+    target = _resolve_nxlang_path(script)
+    if target is None:
+        if script.endswith(".nx"):
+            typer.echo(f"NXLang error: source file not found: {script}", err=True)
+            raise typer.Exit(code=1)
+        return False
+
+    from .nxlang import ERR as NXLangERR
+    from .nxlang import run_file
+
+    try:
+        run_file(target, args=args)
+    except NXLangERR as exc:
+        typer.echo(f"NXLang error: {exc.format()}", err=True)
+        raise typer.Exit(code=1) from exc
+    except KeyboardInterrupt:
+        typer.echo("\nNXLang execution interrupted.", err=True)
+        raise typer.Exit(code=130)
+    return True
 
 
 def _execute_script(script: str, noenv: bool) -> None:
@@ -229,80 +270,67 @@ def _execute_script(script: str, noenv: bool) -> None:
 
 @app.command("dev")
 def dev(
-    port: int = typer.Option(3000, "--port", "-p", help="Port to listen on."),
-    host: str = typer.Option("127.0.0.1", "--host", "-H", help="Host to bind to."),
+    application: str = typer.Argument(
+        ...,
+        help="Python application file to run, e.g. demo.py.",
+    ),
+    host: Optional[str] = typer.Option(
+        None,
+        "--host",
+        "-H",
+        help="Host to bind to (overrides the application).",
+    ),
+    port: Optional[int] = typer.Option(
+        None,
+        "--port",
+        "-p",
+        help="Port to listen on (overrides the application).",
+    ),
     reload: bool = typer.Option(
         True,
         "--reload/--no-reload",
-        help="Watch for file changes and restart the server.",
+        help="Restart the server when Python files change (default: on).",
+    ),
+    app_name: Optional[str] = typer.Option(
+        None,
+        "--app",
+        help="NXserver variable to use when the file defines several.",
     ),
     debug_token: Optional[str] = typer.Option(
         None,
         "--devtools-token",
-        help="Token for the DevTools dashboard. If not set, a random token is generated.",
+        help="Fixed DevTools token. A secure token is generated when omitted.",
     ),
 ):
-    """Start the Nexa development server with auto-reload.
+    """Run a Nexa application in development mode with DevTools."""
+    from .devserver import DevError, run_dev_app, serve_with_reload
 
-    The server runs in debug mode with the DevTools dashboard enabled.
-    When --reload is active (the default), the server watches for file
-    changes and restarts automatically.
-    """
-    from Nexa import NXserver
-
-    app_server = NXserver("dev", debug=True, port=port, host=host)
-
-    if debug_token is not None:
-        app_server.devtools.token = debug_token
-
-    print(f"\nDevTools token: {app_server.devtools.token}")
-    print(f"DevTools dashboard: http://{host}:{port}/__nexa__/\n")
-
-    if reload:
-        import multiprocessing
-
-        import watchfiles
-
-        def _run_server() -> None:
-            try:
-                app_server.run()
-            except KeyboardInterrupt:
-                pass
-
-        ctx = multiprocessing.get_context("spawn")
-        proc = ctx.Process(target=_run_server, daemon=True)
-        proc.start()
-
-        try:
-            watchfiles.watch(
-                str(Path.cwd()),
-                watch_filter=watchfiles.PythonFilter(),
-                debounce=300,
-                on_iter=lambda change_queue: _reload_on_changes(change_queue, proc, _run_server),
+    try:
+        if reload:
+            serve_with_reload(
+                application,
+                host=host,
+                port=port,
+                attribute=app_name,
+                token=debug_token,
             )
-        except KeyboardInterrupt:
-            proc.terminate()
-            proc.join(timeout=5)
-            print("\nServer stopped.")
-    else:
-        try:
-            app_server.run()
-        except KeyboardInterrupt:
-            print("\nServer stopped.")
-
-
-def _reload_on_changes(change_queue, proc, run_server_fn) -> None:
-    """Reload the server when Python files change."""
-    changes = list(change_queue)
-    if changes:
-        print(f"\nChanges detected in: {[str(c[0]) for c in changes]}")
-        print("Restarting server...\n")
-        proc.terminate()
-        proc.join(timeout=5)
-        ctx = multiprocessing.get_context("spawn")
-        new_proc = ctx.Process(target=run_server_fn, daemon=True)
-        new_proc.start()
-        return new_proc
+        else:
+            run_dev_app(
+                application,
+                host=host,
+                port=port,
+                attribute=app_name,
+                token=debug_token,
+            )
+    except DevError as exc:
+        typer.echo(f"Nexa development error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    except OSError as exc:
+        typer.echo(f"Nexa development error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    except KeyboardInterrupt:
+        typer.echo("\nServer stopped.", err=True)
+        raise typer.Exit(code=130)
 
 
 @app.command("routes")

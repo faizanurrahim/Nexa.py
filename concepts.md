@@ -1,8 +1,11 @@
 # Nexa.py Basic Concepts
 
-> Version 0.7.0 adds WebSocket support, Blade component templates, NXscript
-> inheritance and includes, template caching, DevTools dashboard, lifecycle
-> hooks, custom error handlers, and new CLI commands (`nexa dev`, `nexa routes`).
+> Version 0.9.1 adds the `nexa dev <file>` workflow: application discovery,
+> automatic DevTools initialization on the application's own `NXserver`, a
+> subprocess-based reloader that works on Windows, and the optional
+> `watchfiles` dependency. It builds on 0.9.0 (NXLang Base, `nexa exec`,
+> DevTools sessions, typed routing) and 0.7.0 (WebSockets, Blade, NXscript
+> inheritance, hooks, and `nexa routes`).
 
 
 # Concept 1: API Creation

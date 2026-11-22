@@ -1,6 +1,6 @@
 
 import json
-from typing import Any
+from typing import Any, Optional
 
 
 class JSONResponse:
@@ -10,16 +10,22 @@ class JSONResponse:
     directly if you prefer the explicit style.
     """
 
-    def __init__(self, data: Any, status: int = 200) -> None:
+    def __init__(
+        self,
+        data: Any,
+        status: int = 200,
+        headers: Optional[dict[str, str]] = None,
+    ) -> None:
         self.data = data
         self.status = status
+        self.headers = dict(headers) if headers else {}
 
     def render(self) -> str:
         """Return the JSON-encoded body for this response."""
         return json.dumps(self.data, ensure_ascii=False)
 
 
-def jsonify(data: Any, status: int = 200) -> JSONResponse:
+def jsonify(data: Any, status: int = 200, headers: Optional[dict[str, str]] = None) -> JSONResponse:
     """Create a JSON response for a Nexa route.
 
     Args:
@@ -30,4 +36,4 @@ def jsonify(data: Any, status: int = 200) -> JSONResponse:
     Returns:
         A JSONResponse instance that the Nexa server can render.
     """
-    return JSONResponse(data=data, status=status)
+    return JSONResponse(data=data, status=status, headers=headers)

@@ -17,6 +17,7 @@ from http.server import ThreadingHTTPServer as HTTPServer
 from pathlib import Path
 from typing import Any, Callable, Optional
 from urllib.parse import parse_qs, unquote, urlparse
+import uuid as _uuid
 
 from .__json import JSONResponse
 from .__json import jsonify as _jsonify
@@ -98,6 +99,7 @@ class Request:
         self._form: Optional[dict[str, Any]] = None
         self._files: Optional[dict[str, Any]] = None
         self._cookies: Optional[dict[str, str]] = None
+        self._session: Optional[Session] = None
 
     # -- convenience properties ------------------------------------------------
 
@@ -182,6 +184,17 @@ class Request:
         return self._args
 
     @property
+    def session(self) -> Session:
+        """Return the session for this request.
+
+        Sessions are backed by cookies and signed with the server's
+        ``session_secret`` when configured.
+        """
+        if self._session is None:
+            self._session = Session(self)
+        return self._session
+
+    @property
     def query_params(self) -> dict[str, list[str]]:
         """Query parameters parsed with ``parse_qs``, preserving repeats."""
         if self._query is None:
@@ -193,12 +206,89 @@ class Request:
         return self._remote_addr
 
     @property
+    def client_ip(self) -> str:
+        """Return the client IP address, honoring X-Forwarded-For when present.
+
+        When the request passes through a proxy or load balancer the
+        ``X-Forwarded-For`` header contains the original client IP as the
+        first entry. This property returns that value when available,
+        falling back to ``remote_addr`` otherwise.
+        """
+        forwarded = self._headers.get("X-Forwarded-For", "")
+        if forwarded:
+            return forwarded.split(",", 1)[0].strip()
+        return self._remote_addr
+
+    @property
     def server_name(self) -> str:
         return self._server_name
 
     @property
     def server_port(self) -> str:
         return self._server_port
+
+    # -- query helper methods --------------------------------------------------
+
+    def get_query(self, key: str, default: Any = None) -> Any:
+        """Return the first value for *key* from the query string.
+
+        Args:
+            key: The query parameter name.
+            default: Value to return when the parameter is absent.
+
+        Example::
+
+            page = request.get_query("page", default="1")
+        """
+        values = self.query_params.get(key)
+        if values:
+            return values[0] if len(values) == 1 else values
+        return default
+
+    def get_query_int(self, key: str, default: int = 0) -> int:
+        """Return *key* parsed as an integer, with *default* when absent.
+
+        Returns *default* when the parameter is missing or cannot be parsed.
+        """
+        value = self.get_query(key)
+        if value is None:
+            return default
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    def get_query_float(self, key: str, default: float = 0.0) -> float:
+        """Return *key* parsed as a float, with *default* when absent.
+
+        Returns *default* when the parameter is missing or cannot be parsed.
+        """
+        value = self.get_query(key)
+        if value is None:
+            return default
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    def get_query_bool(self, key: str, default: bool = False) -> bool:
+        """Return *key* parsed as a boolean.
+
+        Recognises ``"true"``, ``"1"``, ``"yes"``, ``"on"`` (case-insensitive)
+        as True and ``"false"``, ``"0"``, ``"no"``, ``"off"`` as False.
+        Returns *default* when the parameter is absent.
+        """
+        value = self.get_query(key)
+        if value is None:
+            return default
+        if isinstance(value, list):
+            value = value[0] if value else ""
+        v = str(value).lower()
+        if v in {"true", "1", "yes", "on"}:
+            return True
+        if v in {"false", "0", "no", "off"}:
+            return False
+        return default
 
     # -- internal helpers ------------------------------------------------------
 
@@ -547,6 +637,15 @@ class Response:
     Example usage::
 
         return Response("Created", status=201, headers={"X-Powered-By": "Nexa"})
+
+    Convenience constructors::
+
+        Response.text("Hello")
+        Response.html("<h1>Hello</h1>")
+        Response.json({"success": True})
+        Response.redirect("/dashboard")
+        Response.file("report.pdf")
+        Response.empty(status=204)
     """
 
     def __init__(
@@ -592,6 +691,291 @@ class Response:
             content_type = "text/html; charset=utf-8"
 
         return body_bytes, content_type, self.status, headers
+
+    # -- convenient constructors ---------------------------------------------
+
+    @classmethod
+    def text(
+        cls,
+        body: str,
+        status: int = 200,
+        headers: Optional[dict[str, str]] = None,
+    ) -> Response:
+        """Return a plain-text response."""
+        h = dict(headers) if headers else {}
+        h.setdefault("Content-Type", "text/plain; charset=utf-8")
+        return cls(body, status=status, content_type="text/plain; charset=utf-8", headers=h)
+
+    @classmethod
+    def html(
+        cls,
+        body: str,
+        status: int = 200,
+        headers: Optional[dict[str, str]] = None,
+    ) -> Response:
+        """Return an HTML response."""
+        h = dict(headers) if headers else {}
+        h.setdefault("Content-Type", "text/html; charset=utf-8")
+        return cls(body, status=status, content_type="text/html; charset=utf-8", headers=h)
+
+    @classmethod
+    def json(
+        cls,
+        data: Any,
+        status: int = 200,
+        headers: Optional[dict[str, str]] = None,
+    ) -> Response:
+        """Return a JSON response."""
+        import json as _json
+
+        body_bytes = _json.dumps(data, ensure_ascii=False).encode("utf-8")
+        h = dict(headers) if headers else {}
+        h.setdefault("Content-Type", "application/json; charset=utf-8")
+        return cls(body_bytes, status=status, content_type="application/json; charset=utf-8", headers=h)
+
+    @classmethod
+    def redirect(
+        cls,
+        location: str,
+        status: int = 302,
+        headers: Optional[dict[str, str]] = None,
+    ) -> Response:
+        """Return a redirect response.
+
+        Args:
+            location: The URL to redirect to.
+            status: HTTP status code. Defaults to 302 (Found).
+                Use 301 for permanent, 303/307/308 as appropriate.
+            headers: Extra headers to include.
+        """
+        h = {"Location": location}
+        if headers:
+            h.update(headers)
+        return cls("", status=status, headers=h)
+
+    @classmethod
+    def file(
+        cls,
+        path: str | Path,
+        status: int = 200,
+        headers: Optional[dict[str, str]] = None,
+        content_type: Optional[str] = None,
+    ) -> Response:
+        """Return a response serving a file.
+
+        Args:
+            path: Path to the file to serve.
+            status: HTTP status code. Defaults to 200.
+            headers: Extra headers to include.
+            content_type: Optional content type. Auto-detected if not provided.
+        """
+        from pathlib import Path as _Path
+
+        file_path = Path(path) if isinstance(path, str) else path
+        if not file_path.is_file():
+            raise FileNotFoundError(f"File not found: {file_path}")
+
+        body_bytes = file_path.read_bytes()
+        if content_type is None:
+            import mimetypes
+
+            content_type = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
+
+        h = dict(headers) if headers else {}
+        h.setdefault("Content-Type", content_type)
+        h.setdefault("Content-Length", str(len(body_bytes)))
+        return cls(body_bytes, status=status, content_type=content_type, headers=h)
+
+    @classmethod
+    def empty(
+        cls,
+        status: int = 204,
+        headers: Optional[dict[str, str]] = None,
+    ) -> Response:
+        """Return an empty response with no body.
+
+        Args:
+            status: HTTP status code. Defaults to 204 (No Content).
+            headers: Extra headers to include.
+        """
+        return cls(b"", status=status, content_type="text/plain; charset=utf-8", headers=headers)
+
+
+class HTMLResponse(Response):
+    """A convenience response that renders an HTML body.
+
+    Equivalent to ``Response.html(...)`` but readable when used directly::
+
+        return HTMLResponse("<h1>Hello</h1>", status=201)
+    """
+
+    def __init__(
+        self,
+        body: Any = "",
+        status: int = 200,
+        headers: Optional[dict[str, str]] = None,
+    ) -> None:
+        merged = dict(headers) if headers else {}
+        merged.setdefault("Content-Type", "text/html; charset=utf-8")
+        super().__init__(
+            body,
+            status=status,
+            content_type="text/html; charset=utf-8",
+            headers=merged,
+        )
+
+
+class TextResponse(Response):
+    """A convenience response that renders a plain-text body.
+
+    Equivalent to ``Response.text(...)`` but readable when used directly::
+
+        return TextResponse("hello", status=200)
+    """
+
+    def __init__(
+        self,
+        body: Any = "",
+        status: int = 200,
+        content_type: Optional[str] = None,
+        headers: Optional[dict[str, str]] = None,
+    ) -> None:
+        if content_type is None:
+            content_type = "text/plain; charset=utf-8"
+        merged = dict(headers) if headers else {}
+        merged.setdefault("Content-Type", content_type)
+        super().__init__(
+            body,
+            status=status,
+            content_type=content_type,
+            headers=merged,
+        )
+
+
+class Session:
+    """Per-session state for a visitor, backed by cookies.
+
+    Example usage within a route handler::
+
+        session = Session(request)
+        session["user_id"] = 42
+        session["prefs"]["theme"] = "dark"
+        response = Response.html("<h1>Welcome</h1>")
+        session.apply(response)
+        return response
+
+    By default sessions expire after 24 hours and are signed with the server's
+    ``session_secret`` to prevent tampering. Set ``session_secret`` on the
+    :class:`NXserver` to enable signing.
+    """
+
+    def __init__(self, request: Request, name: str = "__nexa_session") -> None:
+        self._request = request
+        self._name = name
+        self._data: dict[str, Any] = {}
+        self._modified = False
+        self._deleted = False
+        self._load()
+
+    def _load(self) -> None:
+        value = self._request.cookies.get(self._name)
+        if value is None:
+            return
+        server = _current_server.get()
+        secret = getattr(server, "session_secret", None) if server is not None else None
+        if secret:
+            value = self._verify(value, secret)
+            if value is None:
+                self._data = {}
+                return
+        self._data = _decode_session(value)
+
+    def _verify(self, value: str, secret: str) -> Optional[str]:
+        """Verify the session cookie signature; return the plaintext payload or None."""
+        try:
+            payload, sig = value.rsplit("--", 1)
+        except ValueError:
+            return None
+        expected = _sign(payload, secret)
+        return payload if sig == expected else None
+
+    def __getitem__(self, key: str) -> Any:
+        return self._data[key]
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        if key not in self._data or self._data[key] != value:
+            self._modified = True
+        self._data[key] = value
+
+    def __delitem__(self, key: str) -> None:
+        del self._data[key]
+        self._modified = True
+
+    def __contains__(self, key: str) -> bool:
+        return key in self._data
+
+    def __iter__(self):
+        return iter(self._data)
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return self._data.get(key, default)
+
+    def pop(self, key: str, default: Any = None) -> Any:
+        value = self._data.pop(key, default)
+        self._modified = True
+        return value
+
+    def clear(self) -> None:
+        self._data.clear()
+        self._modified = True
+        self._deleted = True
+
+    def apply(self, response: Response) -> None:
+        """Attach the session cookie to *response* if the session was modified.
+
+        Sets ``session_expires`` seconds from now when the session was modified,
+        and removes the cookie when :meth:`clear` was called.
+        """
+        if not self._modified and not self._deleted:
+            return
+        server = _current_server.get()
+        secret = getattr(server, "session_secret", None) if server is not None else None
+        if self._deleted:
+            response.headers["Set-Cookie"] = (
+                f"{self._name}=; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Path=/"
+            )
+            return
+        payload = _encode_session(self._data)
+        if secret:
+            payload = payload + "--" + _sign(payload, secret)
+        server = _current_server.get()
+        expiry = server.session_expires if server is not None else 86400
+        expires = datetime.utcnow() + timedelta(seconds=expiry)
+        expires_str = expires.strftime("%a, %d %b %Y %H:%M:%S GMT")
+        response.headers["Set-Cookie"] = (
+            f"{self._name}={payload}; Path=/; HttpOnly; Expires={expires_str}"
+        )
+
+
+def _encode_session(data: dict[str, Any]) -> str:
+    return base64.urlsafe_b64encode(json.dumps(data, ensure_ascii=False).encode("utf-8")).rstrip(b"=").decode("ascii")
+
+
+def _decode_session(value: str) -> dict[str, Any]:
+    try:
+        padded = value + "=" * (4 - len(value) % 4) if len(value) % 4 else value
+        return json.loads(base64.urlsafe_b64decode(padded).decode("utf-8"))
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+
+
+def _sign(payload: str, secret: str) -> str:
+    import hashlib as _hashlib
+
+    return _hashlib.sha256(f"{payload}:{secret}".encode("utf-8")).hexdigest()[:16]
 
 
 def redirect(location: str, status: int = 302, headers: Optional[dict[str, str]] = None) -> Response:
@@ -650,21 +1034,66 @@ class _Route:
     handler: Callable
     methods: set[str] = field(default_factory=lambda: {"GET", "HEAD"})
     param_names: list[str] = field(default_factory=list)
+    param_converters: list[str] = field(default_factory=list)
     original_path: str = ""
+    name: str = ""
+
+
+def _validate_uuid(value: str) -> _uuid.UUID:
+    return _uuid.UUID(value)
+
+
+def _validate_param(value: str, converter: str) -> Any:
+    """Convert *value* with *converter*.
+
+    Raises ``ValueError`` on invalid input so the matcher can treat the route
+    as non-matching and fall through to the normal 404 path.
+    """
+    if converter == "string":
+        return value
+    if converter == "path":
+        return value
+    if converter == "int":
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            raise ValueError(f"invalid int value {value!r}")
+    if converter == "float":
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            raise ValueError(f"invalid float value {value!r}")
+    if converter == "uuid":
+        return _validate_uuid(value)
+    raise ValueError(f"unknown converter {converter!r}")
 
 
 class Router:
     """A small path-router with support for static and parameterized routes.
 
-    Parameterized paths look like ``"/api/users/<user_id>"``. Parameter names
-    must be valid Python identifiers. Static routes take priority over
-    parameterized ones, and more-specific parameterized routes are preferred
-    over less-specific ones when the number of static segments is equal.
+    Parameterized paths look like ``"/api/users/<user_id>"`` or with type
+    converters like ``"/api/users/<int:user_id>"``, ``"/files/<path:filename>"``, ``"/uuid/<uuid:uid>"``.
+
+    Static routes take priority over parameterized ones, and more-specific
+    parameterized routes are preferred over less-specific ones when the
+    number of static segments is equal.
+
+    Routes can be named for URL generation via :meth:`url_for` or
+    :meth:`build_url`.
     """
+
+    _CONVERTERS: dict[str, Callable[[str], Any]] = {
+        "string": str,
+        "int": int,
+        "float": float,
+        "path": str,
+        "uuid": _validate_uuid,
+    }
 
     def __init__(self) -> None:
         self._static: dict[str, _Route] = {}
         self._params: list[_Route] = []
+        self._named: dict[str, _Route] = {}
         # Aliases for the DevTools property on NXserver.
         self._static_routes = self._static
         self._param_routes = self._params
@@ -674,6 +1103,7 @@ class Router:
         path: str,
         handler: Callable,
         methods: set[str] | None = None,
+        name: str | None = None,
     ) -> None:
         if not path.startswith("/"):
             raise ValueError("Routes must start with '/'")
@@ -689,28 +1119,58 @@ class Router:
             method_set.add("HEAD")
 
         route = self._build_route(path, handler, method_set)
-        route._original_path = path
+        route.original_path = path
+        route.name = name or ""
+
         if self._is_param_path(path):
+            for existing in self._params:
+                if existing.pattern == route.pattern and existing.methods & route.methods:
+                    overlapping = ", ".join(sorted(existing.methods & route.methods))
+                    raise ValueError(
+                        f"Route {path!r} conflicts with {existing.original_path!r} "
+                        f"for method(s) {overlapping}"
+                    )
             self._params.append(route)
         else:
             if path in self._static:
                 raise ValueError(f"Route {path!r} already registered")
             self._static[path] = route
 
+        if name:
+            if name in self._named:
+                raise ValueError(f"Route name {name!r} is already registered")
+            self._named[name] = route
+
     def _build_route(
         self, path: str, handler: Callable, methods: set[str]
     ) -> _Route:
         param_names: list[str] = []
+        param_converters: list[str] = []
         segments: list[str] = []
         for seg in path.strip("/").split("/"):
             if not seg:
                 continue
             if seg.startswith("<") and seg.endswith(">"):
-                name = seg[1:-1]
-                if not name.isidentifier():
-                    raise ValueError(
-                        f"Invalid parameter name {name!r} in route {path!r}"
-                    )
+                inner = seg[1:-1]
+                if ":" in inner:
+                    converter, name = inner.split(":", 1)
+                    if not name.isidentifier():
+                        raise ValueError(
+                            f"Invalid parameter name {name!r} in route {path!r}"
+                        )
+                    if converter not in self._CONVERTERS:
+                        raise ValueError(
+                            f"Unknown converter {converter!r} in route {path!r}. "
+                            f"Supported: {', '.join(sorted(self._CONVERTERS))}"
+                        )
+                else:
+                    converter = "string"
+                    name = inner
+                    if not name.isidentifier():
+                        raise ValueError(
+                            f"Invalid parameter name {name!r} in route {path!r}"
+                        )
+                param_converters.append(converter)
                 param_names.append(name)
                 segments.append(None)  # placeholder for a param segment
             else:
@@ -718,12 +1178,19 @@ class Router:
         pattern = "/" + "/".join(
             f"<{i}>" if s is None else s for i, s in enumerate(segments)
         )
-        return _Route(pattern=pattern, handler=handler, methods=methods, param_names=param_names, original_path=path)
+        return _Route(
+            pattern=pattern,
+            handler=handler,
+            methods=methods,
+            param_names=param_names,
+            param_converters=param_converters,
+            original_path=path,
+        )
 
     def _is_param_path(self, path: str) -> bool:
         return "<" in path
 
-    def match(self, path: str) -> tuple[Optional[_Route], dict[str, str]]:
+    def match(self, path: str) -> tuple[Optional[_Route], dict[str, Any]]:
         """Return ``(route, params)`` or ``(None, {})`` when there is no match."""
         # Exact static match first.
         if path in self._static:
@@ -732,7 +1199,7 @@ class Router:
         # Attempt parameterized routes. Among matching parameterized routes
         # prefer the one with the most literal segments (most specific).
         best: Optional[_Route] = None
-        best_params: dict[str, str] = {}
+        best_params: dict[str, Any] = {}
         best_literal_count = -1
 
         for route in self._params:
@@ -742,25 +1209,52 @@ class Router:
             literal_count = sum(1 for seg in route.pattern.strip("/").split("/") if not seg.startswith("<"))
             if literal_count > best_literal_count:
                 best = route
-                best_params = params
+                best_params = dict(params)
                 best_literal_count = literal_count
 
         if best is not None:
             return best, best_params
         return None, {}
 
-    def _match_param_route(self, route: _Route, path: str) -> Optional[dict[str, str]]:
+    def _match_param_route(self, route: _Route, path: str) -> Optional[dict[str, Any]]:
+        """Return converted params dict or ``None`` when there is no match.
+
+        The ``path`` converter is special: it consumes the remainder of the URL
+        path starting at its position, including forward slashes. Only one ``path``
+        converter is supported per route and it must be the final parameter.
+        """
         route_segments = [s for s in route.pattern.strip("/").split("/") if s]
         path_segments = [s for s in path.strip("/").split("/") if s]
 
-        if len(route_segments) != len(path_segments):
+        # The ``path`` converter swallows the rest of the URL, so a route that
+        # ends with one may match a path with more segments than the pattern.
+        has_path_tail = bool(route.param_converters) and route.param_converters[-1] == "path"
+        if has_path_tail:
+            if len(path_segments) < len(route_segments):
+                return None
+        elif len(route_segments) != len(path_segments):
             return None
 
-        params: dict[str, str] = {}
-        for rs, ps in zip(route_segments, path_segments):
+        params: dict[str, Any] = {}
+        param_index = 0
+        for seg_index, rs in enumerate(route_segments):
             if rs.startswith("<"):
-                params[route.param_names[len(params)]] = ps
-            elif rs != ps:
+                converter = route.param_converters[param_index]
+                name = route.param_names[param_index]
+                if converter == "path":
+                    try:
+                        params[name] = _validate_param(
+                            "/".join(path_segments[seg_index:]), converter
+                        )
+                    except ValueError:
+                        return None
+                    return params
+                try:
+                    params[name] = _validate_param(path_segments[seg_index], converter)
+                except ValueError:
+                    return None
+                param_index += 1
+            elif rs != path_segments[seg_index]:
                 return None
         return params
 
@@ -773,10 +1267,82 @@ class Router:
                 return route
         return None
 
+    def url_for(self, name: str, **params: Any) -> str:
+        """Build the URL for the named route *name*.
+
+        Parameter values are converted to strings and percent-encoded. A
+        ``path`` converter keeps its forward slashes (each segment is encoded
+        separately) so generated URLs stay valid.
+
+        Raises:
+            ValueError: when *name* is unknown, a required parameter is
+                missing, or an unexpected parameter is supplied.
+        """
+        route = self._named.get(name)
+        if route is None:
+            known = ", ".join(sorted(self._named)) or "none"
+            raise ValueError(f"No route named {name!r} is registered (known: {known})")
+
+        missing = [p for p in route.param_names if p not in params]
+        if missing:
+            raise ValueError(
+                f"Missing URL parameter(s) for route {name!r}: {', '.join(missing)}"
+            )
+        extra = [p for p in params if p not in route.param_names]
+        if extra:
+            raise ValueError(
+                f"Unexpected URL parameter(s) for route {name!r}: {', '.join(extra)}"
+            )
+
+        parts: list[str] = []
+        param_index = 0
+        for seg in route.original_path.strip("/").split("/"):
+            if not seg:
+                continue
+            if seg.startswith("<") and seg.endswith(">"):
+                converter = route.param_converters[param_index]
+                value = params[route.param_names[param_index]]
+                param_index += 1
+                if converter == "path":
+                    parts.append(
+                        "/".join(
+                            urllib.parse.quote(part, safe="")
+                            for part in str(value).split("/")
+                        )
+                    )
+                else:
+                    parts.append(urllib.parse.quote(str(value), safe=""))
+            else:
+                parts.append(seg)
+        return "/" + "/".join(parts)
+
+    def build_url(self, name: str, **params: Any) -> str:
+        """Alias for :meth:`url_for`."""
+        return self.url_for(name, **params)
+
 
 # ---------------------------------------------------------------------------
 # CORS configuration
 # ---------------------------------------------------------------------------
+
+def _origin_matches(origin: str, pattern: str) -> bool:
+    """Check if *origin* matches *pattern*.
+
+    Supports exact match, wildcard suffix (e.g. "*.example.com"),
+    and regex patterns.
+    """
+    if pattern.startswith("regex:"):
+        import re as _re
+
+        try:
+            return bool(_re.fullmatch(pattern[6:], origin))
+        except _re.error:
+            return False
+    if pattern.startswith("*."):
+        suffix = pattern[2:]
+        return origin.endswith(suffix) and "." in origin[:-len(suffix)]
+    return origin == pattern
+
 
 @dataclass
 class CorsConfig:
@@ -803,15 +1369,19 @@ class CorsConfig:
             return False
         if "*" in self.allowed_origins:
             return True
-        return origin in self.allowed_origins
+        for pattern in self.allowed_origins:
+            if _origin_matches(origin, pattern):
+                return True
+        return False
 
     def echo_origin(self, origin: Optional[str]) -> Optional[str]:
         if not self.enabled or not origin:
             return None
         if "*" in self.allowed_origins:
             return origin if self.allow_credentials else "*"
-        if origin in self.allowed_origins:
-            return origin
+        for pattern in self.allowed_origins:
+            if _origin_matches(origin, pattern):
+                return origin if self.allow_credentials else "*"
         return None
 
 
@@ -839,9 +1409,12 @@ class NXserver:
         static_folder: str = "static",
         template_folder: str = "templates",
         max_body_size: int = 1_048_576,  # 1 MiB default
-        cors: Optional[CorsConfig] = None,
+        cors: str | list[str] | CorsConfig | None = None,
         debug: bool = False,
         host: str = "127.0.0.1",
+        session_secret: Optional[str] = None,
+        session_expires: int = 86400,
+        cors_preflight: bool = True,
     ) -> None:
         self.name = name
         if isinstance(port, bool):
@@ -874,8 +1447,11 @@ class NXserver:
         self.static_folder = static_folder
         self.template_folder = template_folder
         self.max_body_size = max_body_size
-        self.cors = cors or CorsConfig()
+        self.cors = self._normalize_cors(cors)
         self.debug = debug
+        self.cors_preflight = cors_preflight
+        self.session_secret = session_secret
+        self.session_expires = session_expires
 
         self.router = Router()
         self._before_request_handlers: list[Callable[[Request], None]] = []
@@ -887,6 +1463,11 @@ class NXserver:
         self._ws_handlers: dict[str, Callable] = {}
         self._devtools: Optional["DevTools"] = None  # noqa: F821 (lazy import)
         self._mount: Optional["DevTools._DevToolsMount"] = None  # noqa: F821 (lazy import)
+        self._dev_mode: bool = False
+        self.session_secret: Optional[str] = None
+        self.session_expires: int = 86400  # 24 hours in seconds
+        self.error_pages: dict[int, Callable[[Request], Any]] = {}
+        self._error_handlers_by_code: dict[int, Callable[[Request, BaseException], tuple[bytes, int, dict[str, str]]]] = {}
 
         project_dir = Path.cwd().resolve()
         self.project_dir = project_dir
@@ -895,13 +1476,19 @@ class NXserver:
 
     # -- route registration ---------------------------------------------------
 
-    def route(self, path: str, methods: Optional[list[str]] = None):
+    def route(
+        self,
+        path: str,
+        methods: Optional[list[str]] = None,
+        name: Optional[str] = None,
+    ):
         """Register a handler for *path*.
 
         Args:
             path: URL path, e.g. ``"/"`` or ``"/api/users/<id>"``.
             methods: Optional explicit list of HTTP methods. When omitted the
                 handler responds to GET and HEAD.
+            name: Optional route name, used by ``url_for()`` to generate URLs.
 
         Example::
 
@@ -922,7 +1509,7 @@ class NXserver:
                     raise ValueError(f"Unsupported HTTP method {m!r}")
 
         def decorator(handler: Callable):
-            self.router.add(path, handler, method_set)
+            self.router.add(path, handler, method_set, name)
             return handler
 
         return decorator
@@ -949,33 +1536,61 @@ class NXserver:
             return ws_handler
         return decorator
 
-        return decorator
+    def get(self, path: str, name: Optional[str] = None):
+        return self.route(path, methods=["GET"], name=name)
 
-    def get(self, path: str):
-        return self.route(path, methods=["GET"])
+    def post(self, path: str, name: Optional[str] = None):
+        return self.route(path, methods=["POST"], name=name)
 
-    def post(self, path: str):
-        return self.route(path, methods=["POST"])
+    def put(self, path: str, name: Optional[str] = None):
+        return self.route(path, methods=["PUT"], name=name)
 
-    def put(self, path: str):
-        return self.route(path, methods=["PUT"])
+    def patch(self, path: str, name: Optional[str] = None):
+        return self.route(path, methods=["PATCH"], name=name)
 
-    def patch(self, path: str):
-        return self.route(path, methods=["PATCH"])
+    def delete(self, path: str, name: Optional[str] = None):
+        return self.route(path, methods=["DELETE"], name=name)
 
-    def delete(self, path: str):
-        return self.route(path, methods=["DELETE"])
+    def options(self, path: str, name: Optional[str] = None):
+        return self.route(path, methods=["OPTIONS"], name=name)
 
-    def options(self, path: str):
-        return self.route(path, methods=["OPTIONS"])
+    def head(self, path: str, name: Optional[str] = None):
+        return self.route(path, methods=["HEAD"], name=name)
 
-    def head(self, path: str):
-        return self.route(path, methods=["HEAD"])
+    def url_for(self, name: str, **params: Any) -> str:
+        """Generate the URL for the named route.
+
+        Example::
+
+            @app.get("/users/<int:user_id>", name="user")
+            def user(user_id):
+                ...
+
+            app.url_for("user", user_id=42)  # '/users/42'
+        """
+        return self.router.url_for(name, **params)
+
+    def build_url(self, name: str, **params: Any) -> str:
+        """Alias for :meth:`url_for`."""
+        return self.router.url_for(name, **params)
+
+    # -- lifecycle hooks (optional, convenient for middleware) --------------
 
     # -- lifecycle hooks (optional, convenient for middleware) --------------
 
     def before_request(self, handler: Callable[[Request], None]):
         """Register a hook that runs before every request.
+
+        Can be used as a decorator or called directly::
+
+            @server.before_request
+            def log_request(req):
+                print(f"{req.method} {req.path}")
+
+            # or:
+            def my_hook(req):
+                ...
+            server.before_request(my_hook)
 
         The hook receives the current :class:`Request` and may raise
         :class:`_RequestError` to short-circuit the request with an error
@@ -988,11 +1603,43 @@ class NXserver:
         """Register a hook that runs after a route returns, before the response
         is sent.
 
+        Can be used as a decorator or called directly::
+
+            @server.after_request
+            def add_header(body, status, headers):
+                headers["X-Custom"] = "value"
+                return body, status, headers
+
         The hook receives ``(response_body, status, headers)`` and should
         return a triple with the same shape.
         """
         self._after_request_handlers.append(handler)
         return handler
+
+    def on_request(self, handler: Callable[[Request], None]):
+        """Alias for :meth:`before_request`. Register a hook that runs before
+        every request.
+
+        Example::
+
+            @server.on_request
+            def logEveryRequest(req):
+                print(f"{req.method} {req.path}")
+        """
+        return self.before_request(handler)
+
+    def on_response(self, handler: Callable[..., Any]):
+        """Alias for :meth:`after_request`. Register a hook that runs after a
+        route returns, before the response is sent.
+
+        Example::
+
+            @server.on_response
+            def add_security_headers(body, status, headers):
+                headers.setdefault("X-Content-Type-Options", "nosniff")
+                return body, status, headers
+        """
+        return self.after_request(handler)
 
     def on_startup(self, handler: Callable[[], None]):
         """Register a hook that runs once when the server starts accepting
@@ -1044,6 +1691,37 @@ class NXserver:
 
         return decorator
 
+    def error(
+        self,
+        code_or_exception: int | type[BaseException],
+    ) -> Callable[
+        [Callable],
+        Callable,
+    ]:
+        """Register a custom error handler by HTTP status code or exception type.
+
+        Can be used as a decorator::
+
+            @server.error(404)
+            def not_found(request, exc):
+                return b'<h1>Page not found</h1>', 404, {"Content-Type": "text/html"}
+
+            @server.error(ValueError)
+            def handle_value_error(request, exc):
+                return b'{"error": "bad value"}', 400, {}
+
+        When *code_or_exception* is an integer, the handler is registered for
+        that HTTP status code. When it is an exception type, the handler is
+        registered for that exception type.
+        """
+        if isinstance(code_or_exception, int):
+            def decorator(handler):
+                self._error_handlers_by_code[code_or_exception] = handler
+                return handler
+            return decorator
+        else:
+            return self.error_handler(code_or_exception)
+
     @property
     def registered_routes(self) -> list[tuple[str, list[str], str]]:
         """Return a list of ``(path, methods, handler_name)`` for all
@@ -1056,7 +1734,7 @@ class NXserver:
         for path, route in self._static_routes.items():
             rows.append((path, sorted(route.methods), route.handler.__name__ if hasattr(route.handler, "__name__") else str(route.handler)))
         for route in self._param_routes:
-            rows.append((route._original_path, sorted(route.methods), route.handler.__name__ if hasattr(route.handler, "__name__") else str(route.handler)))
+            rows.append((route.original_path, sorted(route.methods), route.handler.__name__ if hasattr(route.handler, "__name__") else str(route.handler)))
         return rows
 
     @property
@@ -1109,6 +1787,26 @@ class NXserver:
                     ) from exc
                 raise
 
+    def _normalize_cors(
+        self, cors: str | list[str] | CorsConfig | None
+    ) -> CorsConfig:
+        """Normalize the *cors* parameter to a :class:`CorsConfig`.
+
+        Accepts ``None`` (disabled), ``"*"`` (all origins), a list of
+        origin strings/patterns, or a full :class:`CorsConfig`.
+        """
+        if cors is None:
+            return CorsConfig()
+        if isinstance(cors, CorsConfig):
+            return cors
+        if isinstance(cors, str):
+            if cors == "*":
+                return CorsConfig(enabled=True, allowed_origins=["*"])
+            return CorsConfig(enabled=True, allowed_origins=[cors])
+        if isinstance(cors, list):
+            return CorsConfig(enabled=True, allowed_origins=cors)
+        return CorsConfig()
+
     def _combine_paths(self, prefix: str, path: str) -> str:
         """Combine a blueprint prefix and a route path without duplicate or
         missing slashes.
@@ -1131,11 +1829,29 @@ class NXserver:
         """Handle one WSGI request and return an iterable containing bytes."""
         req: Optional[Request] = None
         try:
-            req = self._build_wsgi_request(environ)
-            body, status, headers = self._process_request(req)
-        except _RequestError as exc:
+            try:
+                req = self._build_wsgi_request(environ)
+                result = self._process_request(req)
+            except _RequestError as exc:
+                result = self._error_response(exc.status, exc.title, exc.detail)
+        except Exception:
+            if self.debug:
+                traceback.print_exc()
+            result = self._error_response(
+                500,
+                "Internal Server Error",
+                "The request could not be handled.",
+            )
+
+        try:
+            body, status, headers = self._finalize_response(result)
+        except Exception:
+            if self.debug:
+                traceback.print_exc()
             body, status, headers = self._error_response(
-                exc.status, exc.title, exc.detail
+                500,
+                "Internal Server Error",
+                "The response could not be constructed.",
             )
 
         status_line = self._status_line(status)
@@ -1264,13 +1980,11 @@ class NXserver:
         req_token = _current_request.set(req)
         server_token = _current_server.set(self)
         try:
-            # DevTools hidden mount — only active when debug=True.
-            if self.debug:
-                _get_devtools()  # trigger lazy import side-effect
-                dt = self._devtools
-                if dt is not None and req.path.startswith("/__nexa__"):
-                    body, status, headers = dt._mount.dispatch(req)
-                    return self._prepare_response(body, headers.get("Content-Type", "text/html; charset=utf-8"), status, headers)
+            # DevTools hidden mount — active in debug mode or after
+            # enable_devtools(), which is what `nexa dev` uses.
+            if self._mount is not None and req.path.startswith("/__nexa__"):
+                body, status, headers = self._mount.dispatch(req)
+                return self._prepare_response(body, headers.get("Content-Type", "text/html; charset=utf-8"), status, headers)
 
             for hook in self._before_request_handlers:
                 try:
@@ -1286,8 +2000,10 @@ class NXserver:
                         "A before-request hook raised an error.",
                     )
 
-            if req.method == "OPTIONS" and self.cors.is_origin_allowed(
-                req.headers.get("Origin")
+            if (
+                req.method == "OPTIONS"
+                and self.cors_preflight
+                and self.cors.is_origin_allowed(req.headers.get("Origin"))
             ):
                 return self._options_response(req)
 
@@ -1323,7 +2039,7 @@ class NXserver:
             except Exception as exc:
                 handler = self._find_error_handler(type(exc))
                 if handler is not None:
-                    return handler(req, exc)
+                    return self._dispatch_exception_handler(handler, req, exc)
                 if self.debug:
                     traceback.print_exc()
                 return self._error_response(
@@ -1393,31 +2109,156 @@ class NXserver:
     def _normalize_response(
         self, body: Any
     ) -> tuple[bytes, str, int, dict[str, str]]:
-        extra_headers: dict[str, str] = {}
-        if isinstance(body, JSONResponse):
-            rendered = body.render()
+        """Normalize a route result into ``(body, content_type, status, headers)``."""
+        return self._coerce_response(body)
+
+    def _coerce_response(
+        self, result: Any, *, default_status: int = 200
+    ) -> tuple[bytes, str, int, dict[str, str]]:
+        """Convert any supported handler return value into response parts.
+
+        Supported values are :class:`Response` (including
+        :class:`HTMLResponse`), :class:`JSONResponse`, rendered
+        ``Element``/``Fragment`` objects, plain ``str``/``bytes``, ``None``
+        (empty body), and ``(body, status)`` or ``(body, status, headers)``
+        tuples.  Unknown values keep the historical behaviour of being
+        rendered with ``str``.
+        """
+        if isinstance(result, Response):
+            body, content_type, status, headers = result.render()
+            return body, content_type, status, dict(headers)
+        if isinstance(result, JSONResponse):
+            rendered = result.render()
+            if not isinstance(rendered, str):
+                rendered = str(rendered)
             return (
                 rendered.encode("utf-8"),
                 "application/json; charset=utf-8",
-                body.status,
-                extra_headers,
+                int(result.status),
+                dict(getattr(result, "headers", {}) or {}),
             )
-        if isinstance(body, (Element, Fragment)):
+        if isinstance(result, (Element, Fragment)):
             return (
-                body.render().encode("utf-8"),
+                result.render().encode("utf-8"),
                 "text/html; charset=utf-8",
-                200,
-                extra_headers,
+                default_status,
+                {},
             )
-        if isinstance(body, Response):
-            response_body, content_type, status, headers = body.render()
-            extra_headers.update(headers)
-            return response_body, content_type, status, extra_headers
-        if isinstance(body, bytes):
-            return body, "text/html; charset=utf-8", 200, extra_headers
-        if isinstance(body, str):
-            return body.encode("utf-8"), "text/html; charset=utf-8", 200, extra_headers
-        return str(body).encode("utf-8"), "text/html; charset=utf-8", 200, extra_headers
+        if isinstance(result, tuple):
+            if len(result) == 3:
+                body, status, raw_headers = result
+            elif len(result) == 2:
+                body, status = result
+                raw_headers = {}
+            else:
+                raise TypeError(
+                    "Response tuples must be (body, status) or "
+                    "(body, status, headers)."
+                )
+            if raw_headers is None:
+                raw_headers = {}
+            if not isinstance(raw_headers, dict):
+                raise TypeError("Response headers must be a dict.")
+            body_bytes, content_type, _ignored, inner_headers = self._coerce_response(
+                body, default_status=status
+            )
+            merged = dict(inner_headers)
+            merged.update(raw_headers)
+            content_type = next(
+                (
+                    value
+                    for name, value in merged.items()
+                    if name.lower() == "content-type"
+                ),
+                content_type,
+            )
+            return body_bytes, content_type, int(status), merged
+        if isinstance(result, bytes):
+            return result, "text/html; charset=utf-8", default_status, {}
+        if isinstance(result, str):
+            return (
+                result.encode("utf-8"),
+                "text/html; charset=utf-8",
+                default_status,
+                {},
+            )
+        if result is None:
+            return b"", "text/html; charset=utf-8", default_status, {}
+        return (
+            str(result).encode("utf-8"),
+            "text/html; charset=utf-8",
+            default_status,
+            {},
+        )
+
+    def _finalize_response(
+        self, result: Any
+    ) -> tuple[bytes, int, list[tuple[str, str]]]:
+        """Return a fully prepared ``(body, status, headers)`` response.
+
+        ``_process_request`` already returns prepared responses; anything
+        else is normalized and validated here, so callers never unpack a
+        response object by mistake.
+        """
+        if (
+            isinstance(result, tuple)
+            and len(result) == 3
+            and isinstance(result[0], bytes)
+            and isinstance(result[1], int)
+            and isinstance(result[2], list)
+        ):
+            return result
+        body, content_type, status, headers = self._coerce_response(result)
+        return self._prepare_response(body, content_type, status, headers)
+
+    def _dispatch_exception_handler(
+        self,
+        handler: Callable[[Request, BaseException], Any],
+        req: Request,
+        exc: BaseException,
+    ) -> tuple[bytes, int, list[tuple[str, str]]]:
+        """Run a custom exception handler and contain its failures.
+
+        The handler may return any supported response value.  If the handler
+        raises, or returns something that cannot be rendered, both the
+        original exception and the handler failure are logged and a safe 500
+        response is returned.
+        """
+        try:
+            result = handler(req, exc)
+        except Exception as handler_exc:
+            self._log_handler_failure(exc, handler_exc)
+            return self._error_response(
+                500,
+                "Internal Server Error",
+                "A custom error handler raised an error while handling the request.",
+            )
+        try:
+            body, content_type, status, headers = self._coerce_response(result)
+        except Exception as handler_exc:
+            self._log_handler_failure(exc, handler_exc)
+            return self._error_response(
+                500,
+                "Internal Server Error",
+                "A custom error handler returned an unsupported response.",
+            )
+        return self._prepare_response(body, content_type, status, headers)
+
+    @staticmethod
+    def _log_handler_failure(
+        original: Optional[BaseException], failure: BaseException
+    ) -> None:
+        """Log a failing custom error handler together with the original error."""
+        try:
+            logger = _get_default_logger()
+            logger.error(
+                "A custom error handler failed while handling %r: %r\n%s",
+                original,
+                failure,
+                traceback.format_exc(),
+            )
+        except Exception:
+            traceback.print_exc()
 
     def _options_response(self, req: Request) -> tuple[bytes, int, list[tuple[str, str]]]:
         origin = req.headers.get("Origin")
@@ -1442,6 +2283,20 @@ class NXserver:
         *,
         traceback_info: Optional[str] = None,
     ) -> tuple[bytes, int, list[tuple[str, str]]]:
+        # Check for a custom error page first.
+        handler = self._error_handlers_by_code.get(status)
+        if handler is not None:
+            try:
+                result = handler(self._current_request_or_none(), None)
+                body, content_type, status_code, resp_headers = self._coerce_response(
+                    result, default_status=status
+                )
+                extra = dict(headers or {})
+                extra.update(resp_headers)
+                return self._prepare_response(body, content_type, status_code, extra)
+            except Exception as exc:
+                self._log_handler_failure(None, exc)
+
         payload: dict[str, Any] = {
             "error": title,
             "detail": detail,
@@ -1452,6 +2307,10 @@ class NXserver:
         return self._prepare_response(
             body, "application/json; charset=utf-8", status, headers or {}
         )
+
+    def _current_request_or_none(self) -> Optional[Request]:
+        """Return the current request, or None if no request is active."""
+        return _current_request.get()
 
     @staticmethod
     def _status_line(status: int) -> str:
@@ -1499,6 +2358,49 @@ class NXserver:
         return body, status, headers
 
     # -- running the server --------------------------------------------------
+
+    def _ensure_devtools(self) -> "DevTools":  # noqa: F821 (lazy import)
+        """Create the DevTools instance and mount once when ``debug=True``.
+
+        Safe to call before :meth:`run`; repeated calls reuse the same
+        instance so the dashboard never ends up with two DevTools objects.
+        """
+        if not (self.debug or self._dev_mode):
+            raise AttributeError(
+                "DevTools is not available. Start the server with debug=True "
+                "or call enable_devtools() first."
+            )
+        if self._devtools is None:
+            dt_mod = _get_devtools()
+            self._devtools = dt_mod.DevTools(self)
+            self._mount = dt_mod._DevToolsMount(self._devtools)
+            # Subscribe DevTools to the default log ring buffer.
+            default_logger = _get_default_logger()
+            default_logger.enable_ring_buffer()
+            default_logger.subscribe_ring(self._devtools.enqueue_log)
+        return self._devtools
+
+    @property
+    def devtools(self) -> "DevTools":  # noqa: F821 (lazy import)
+        """The DevTools instance for a server started with ``debug=True``.
+
+        Available immediately after construction; :meth:`run` reuses this
+        instance rather than creating a second one.
+        """
+        return self._ensure_devtools()
+
+    def enable_devtools(self, token: Optional[str] = None) -> "DevTools":  # noqa: F821
+        """Enable the DevTools dashboard for a development session.
+
+        Unlike ``debug=True`` this does not enable debug error output; it only
+        mounts DevTools. Used by ``nexa dev`` so an application's existing
+        server gains DevTools without the application opting in.
+        """
+        self._dev_mode = True
+        devtools = self._ensure_devtools()
+        if token is not None:
+            devtools.token = token
+        return devtools
 
     def run(self):
         server = self
@@ -1627,11 +2529,31 @@ class NXserver:
             def _handle_request(self) -> None:
                 try:
                     req = self._build_request()
-                    body, status, headers = server._process_request(req)
+                    result = server._process_request(req)
                 except _RequestError as exc:
-                    body, status, headers = server._error_response(
+                    result = server._error_response(
                         exc.status, exc.title, exc.detail
                     )
+                except Exception:
+                    if server.debug:
+                        traceback.print_exc()
+                    result = server._error_response(
+                        500,
+                        "Internal Server Error",
+                        "The request could not be handled.",
+                    )
+
+                try:
+                    body, status, headers = server._finalize_response(result)
+                except Exception:
+                    if server.debug:
+                        traceback.print_exc()
+                    body, status, headers = server._error_response(
+                        500,
+                        "Internal Server Error",
+                        "The response could not be constructed.",
+                    )
+
                 self._send_prepared_response(body, status, headers)
 
             def _try_websocket_upgrade(self) -> bool:
@@ -1692,15 +2614,11 @@ class NXserver:
             def log_message(self, fmt, *args):
                 print(f"[{server.name}] {fmt % args}")
 
-        # Set up DevTools if debug mode is enabled.
+        # Set up DevTools if debug mode is enabled. Any instance created
+        # before run() (for example by `nexa dev` when printing the token)
+        # is reused rather than replaced.
         if self.debug:
-            dt_mod = _get_devtools()
-            self._devtools = dt_mod.DevTools(self)
-            self._mount = dt_mod._DevToolsMount(self._devtools)
-            # Subscribe DevTools to the default log ring buffer.
-            _default_logger = _get_default_logger()
-            _default_logger.enable_ring_buffer()
-            _default_logger.subscribe_ring(self._devtools.enqueue_log)
+            self._ensure_devtools()
 
         try:
             httpd = HTTPServer((self.host, self.port), Handler)

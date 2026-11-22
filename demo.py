@@ -1,5 +1,5 @@
 """
-Nexa.py 0.7.0 demo — lifecycle hooks, error handlers, DevTools, WebSocket, Blade.
+Nexa.py 0.9.1 demo — lifecycle hooks, error handlers, DevTools, WebSocket, Blade.
 
 Run with::
 
@@ -77,7 +77,7 @@ class Card(BladeNode):
 def home(request) -> str:
     """Home page using a Blade component."""
     return Card(
-        "Welcome to Nexa.py 0.7.0",
+        "Welcome to Nexa.py 0.9.1",
         "This page is rendered with a Blade component.",
         "Try the <a href='/api/value'>JSON API</a> or the "
         "<a href='/api/error'>custom error handler</a>.",

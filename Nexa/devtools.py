@@ -21,9 +21,9 @@ Usage::
 
 from __future__ import annotations
 
+import hmac
 import html
-import random
-import string
+import secrets
 import time
 import traceback
 from collections import deque
@@ -74,9 +74,8 @@ class DevToolsErrorEntry:
 
 
 def _default_debug_token() -> str:
-    """Return a random 16-character token for devtools auth."""
-    alphabet = string.ascii_letters + string.digits
-    return "".join(random.choices(alphabet, k=16))
+    """Return a cryptographically random token for DevTools auth."""
+    return secrets.token_urlsafe(24)
 
 
 def _sanitize_traceback(tb: str, project_dir: Optional[str]) -> str:
@@ -112,6 +111,8 @@ class DevTools:
         self._error_log: deque[DevToolsErrorEntry] = deque(maxlen=100)
         self._token: str | None = None
         self._log_tail: deque[str] = deque(maxlen=500)
+        self._sessions: dict[str, float] = {}
+        self._session_ttl = 8 * 60 * 60
 
     # -- token ----------------------------------------------------------------
 
@@ -195,20 +196,151 @@ class DevTools:
 
     # -- dashboard pages ------------------------------------------------------
 
-    def _protect(self, request: Request) -> Optional[tuple[str, int]]:
+    def _protect(self, request: Request) -> Optional[tuple[bytes, int, dict[str, str]]]:
         """Return an error response if the request is not authenticated."""
-        token = request.headers.get("X-DevTools-Token", "")
-        if token != self.token:
+        if self._authenticated(request):
+            return None
+        return (
+            b'{"error":"forbidden","detail":"invalid or missing X-DevTools-Token"}',
+            403,
+            {"Content-Type": "application/json; charset=utf-8"},
+        )
+
+    # -- browser sessions -----------------------------------------------------
+
+    SESSION_COOKIE = "nexa_devtools"
+
+    def _is_local_request(self, request: Request) -> bool:
+        """DevTools is a local tool; non-local clients are always refused."""
+        remote = (getattr(request, "remote_addr", "") or "").strip()
+        return remote in {"", "127.0.0.1", "::1", "localhost"}
+
+    def _session_is_valid(self, session_id: str) -> bool:
+        expires = self._sessions.get(session_id)
+        if expires is None:
+            return False
+        if expires <= time.time():
+            self._sessions.pop(session_id, None)
+            return False
+        return True
+
+    def _authenticated(self, request: Request) -> bool:
+        """Accept either the API header token or a valid browser session."""
+        header = request.headers.get("X-DevTools-Token", "")
+        if header and hmac.compare_digest(header, self.token):
+            return True
+        session_id = request.cookies.get(self.SESSION_COOKIE, "")
+        return bool(session_id) and self._session_is_valid(session_id)
+
+    def _new_session(self) -> str:
+        now = time.time()
+        for session_id, expires in list(self._sessions.items()):
+            if expires <= now:
+                self._sessions.pop(session_id, None)
+        # A fresh identifier on every login prevents session fixation.
+        session_id = secrets.token_urlsafe(32)
+        self._sessions[session_id] = now + self._session_ttl
+        return session_id
+
+    def _session_cookie(
+        self, request: Request, session_id: str, *, clear: bool = False
+    ) -> str:
+        secure = (
+            request.headers.get("X-Forwarded-Proto", "").lower() == "https"
+            or getattr(request, "scheme", "") == "https"
+        )
+        if clear:
+            cookie = (
+                f"{self.SESSION_COOKIE}=; Max-Age=0; "
+                "Path=/__nexa__; HttpOnly; SameSite=Strict"
+            )
+        else:
+            cookie = (
+                f"{self.SESSION_COOKIE}={session_id}; Max-Age={self._session_ttl}; "
+                "Path=/__nexa__; HttpOnly; SameSite=Strict"
+            )
+        if secure:
+            cookie += "; Secure"
+        return cookie
+
+    def _login_page(
+        self, request: Request, *, error: str = ""
+    ) -> tuple[bytes, int, dict[str, str]]:
+        """The sign-in page shown to browsers without a session."""
+        message = (
+            f"<p style='color:#f85149'>{html.escape(error)}</p>" if error else ""
+        )
+        page = (
+            "<!doctype html><html lang='en'><head><meta charset='utf-8'>"
+            "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+            "<title>Nexa DevTools — sign in</title></head>"
+            "<body style='margin:0;background:#0e1116;color:#e6edf3;"
+            "font-family:system-ui,sans-serif;display:flex;align-items:center;"
+            "justify-content:center;min-height:100vh'>"
+            "<main style='background:#161b22;border:1px solid #30363d;"
+            "border-radius:8px;padding:24px;max-width:420px;width:100%'>"
+            "<h1 style='font-size:18px;margin:0 0 8px'>Nexa DevTools</h1>"
+            "<p style='color:#8b949e;font-size:13px;margin:0 0 16px'>"
+            "Paste the token printed by <code>nexa dev</code>.</p>"
+            f"{message}"
+            "<form method='post' action='/__nexa__/login'>"
+            "<label style='display:block;font-size:12px;margin-bottom:6px' "
+            "for='token'>Token</label>"
+            "<input id='token' name='token' type='password' autocomplete='off' "
+            "autofocus style='width:100%;padding:8px;border-radius:6px;"
+            "border:1px solid #30363d;background:#0d1117;color:#e6edf3' required>"
+            "<button type='submit' style='margin-top:12px;width:100%;padding:8px;"
+            "border-radius:6px;border:0;background:#238636;color:#fff;"
+            "font-weight:600'>Sign in</button></form>"
+            "<p style='color:#8b949e;font-size:11px;margin:12px 0 0'>"
+            "Programmatic clients may keep using the "
+            "<code>X-DevTools-Token</code> header.</p>"
+            "</main></body></html>"
+        )
+        return page.encode("utf-8"), 200, {"Content-Type": "text/html; charset=utf-8"}
+
+    def _handle_login(self, request: Request) -> tuple[bytes, int, dict[str, str]]:
+        """Create a browser session from the DevTools token."""
+        if not self._is_local_request(request):
             return (
-                b'{"error":"forbidden","detail":"invalid or missing X-DevTools-Token"}',
+                b'{"error":"forbidden","detail":"DevTools is restricted to localhost"}',
                 403,
                 {"Content-Type": "application/json; charset=utf-8"},
             )
-        return None
+        if request.method.upper() != "POST":
+            return self._login_page(request)
+        submitted = request.form.get("token", "")
+        if not isinstance(submitted, str) or not hmac.compare_digest(submitted, self.token):
+            return self._login_page(request, error="Invalid DevTools token.")
+        session_id = self._new_session()
+        return (
+            b"",
+            303,
+            {
+                "Content-Type": "text/html; charset=utf-8",
+                "Location": "/__nexa__/",
+                "Set-Cookie": self._session_cookie(request, session_id),
+            },
+        )
+
+    def _handle_logout(self, request: Request) -> tuple[bytes, int, dict[str, str]]:
+        """Drop the current browser session and clear the cookie."""
+        session_id = request.cookies.get(self.SESSION_COOKIE, "")
+        if session_id:
+            self._sessions.pop(session_id, None)
+        return (
+            b"",
+            303,
+            {
+                "Content-Type": "text/html; charset=utf-8",
+                "Location": "/__nexa__/login",
+                "Set-Cookie": self._session_cookie(request, "", clear=True),
+            },
+        )
 
     def _routes_html(self, request: Request) -> tuple[bytes, int, dict[str, str]]:
-        if err := self._protect(request):
-            return err
+        if not self._authenticated(request):
+            return self._login_page(request)
         routes: list[dict[str, Any]] = []
 
         # Static routes.
@@ -223,7 +355,7 @@ class DevTools:
         # Parameterized routes.
         for route in self._server.router._param_routes:
             routes.append({
-                "path": route._original_path,
+                "path": route.original_path,
                 "methods": sorted(route.methods),
                 "handler": self._format_handler(route.handler),
                 "type": "param",
@@ -248,6 +380,7 @@ class DevTools:
             error_log=list(self._error_log),
             token=self.token,
             server_name=self._server.name,
+            ws_route_count=len(getattr(self._server, "_ws_handlers", {}) or {}),
         )
         return (
             body.encode("utf-8"),
@@ -291,7 +424,7 @@ class DevTools:
             })
         for route in self._server.router._param_routes:
             data["routes"].append({
-                "path": route._original_path,
+                "path": route.original_path,
                 "methods": sorted(route.methods),
                 "params": route.param_names,
                 "type": "param",
@@ -349,6 +482,7 @@ def _render_dashboard(
     error_log: list[DevToolsErrorEntry],
     token: str,
     server_name: str,
+    ws_route_count: int = 0,
 ) -> str:
     """Render the DevTools dashboard as an HTML page."""
     rows = ""
@@ -409,6 +543,7 @@ def _render_dashboard(
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Nexa DevTools — {html.escape(server_name)}</title>
 <style>
   :root {{
@@ -468,6 +603,11 @@ def _render_dashboard(
     font-size: 11px; padding: 1px 0; color: var(--muted);
     border-bottom: 1px solid #ffffff08; }}
   .full {{ grid-column: 1 / -1; }}
+  @media (max-width: 720px) {{
+    .grid {{ grid-template-columns: 1fr; }}
+    .wrap {{ padding: 16px 12px 40px; }}
+    table {{ display: block; overflow-x: auto; }}
+  }}
   .footer {{ margin-top: 24px; color: var(--muted); font-size: 11px; }}
   .git {{ color: var(--muted); font-size: 11px; }}
 </style>
@@ -478,7 +618,8 @@ def _render_dashboard(
   <p class="subtitle">Debug dashboard for <code>{html.escape(server_name)}</code> ·
     <a href="/__nexa__/api">JSON API</a> ·
     <a href="/__nexa__/log">Log tail</a> ·
-    <a href="/__nexa__/clear">Clear logs</a>
+    <a href="/__nexa__/clear">Clear logs</a> ·
+    <a href="/__nexa__/logout">Sign out</a>
   </p>
 
   <div class="token-bar">
@@ -488,6 +629,20 @@ def _render_dashboard(
   </div>
 
   <div class="grid">
+    <div class="card full">
+      <h2>Server status</h2>
+      <table>
+        <tbody>
+          <tr><td>Server</td><td>{html.escape(server_name)}</td></tr>
+          <tr><td>Debug mode</td><td>{'on' if config.get('debug') else 'off'}</td></tr>
+          <tr><td>Bind address</td><td>{html.escape(str(config.get('host')))}:{html.escape(str(config.get('port')))}</td></tr>
+          <tr><td>WebSocket routes</td><td>{ws_route_count}</td></tr>
+          <tr><td>Recorded requests</td><td>{len(request_log)}</td></tr>
+          <tr><td>Recorded errors</td><td>{len(error_log)}</td></tr>
+        </tbody>
+      </table>
+    </div>
+
     <div class="card">
       <h2>Routes ({len(routes)})</h2>
       <table>
@@ -558,6 +713,8 @@ class _DevToolsMount:
             "/api": devtools._json_route,
             "/log": devtools._log_tail_json,
             "/clear": devtools._clear_log,
+            "/login": devtools._handle_login,
+            "/logout": devtools._handle_logout,
         }
 
     def __call__(self, request: Request) -> tuple[bytes, int, dict[str, str]]:
@@ -565,6 +722,13 @@ class _DevToolsMount:
 
     def dispatch(self, request: Request) -> tuple[bytes, int, dict[str, str]]:
         """Dispatch a request to the matching DevTools handler."""
+        if not self._devtools._is_local_request(request):
+            return (
+                b'{"error":"forbidden","detail":"DevTools is restricted to localhost"}',
+                403,
+                {"Content-Type": "application/json; charset=utf-8"},
+            )
+
         from urllib.parse import unquote, urlparse
         parsed = urlparse(request.path)
         path = unquote(parsed.path)
