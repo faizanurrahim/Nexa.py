@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "Nexa.py"
-version = "0.5.2"
+version = "0.6.0"
 description = "Nexa.py — a Python-based web framework and development platform"
 readme = "README.md"
 requires-python = ">=3.11"

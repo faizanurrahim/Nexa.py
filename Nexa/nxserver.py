@@ -13,7 +13,7 @@ import warnings
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer as HTTPServer
 from pathlib import Path
 from typing import Any, Callable, Optional
 from urllib.parse import parse_qs, unquote, urlparse
@@ -1507,6 +1507,12 @@ class NXserver:
             f"{self.name} NXserver listening on {self.host}:{bound_port}; "
             f"access at http://{access_host}:{bound_port}"
         )
+
+        # Configure connection-level limits and timeouts.
+        # ThreadingHTTPServer reuses the listen socket across threads; set a
+        # reasonable request timeout so hung clients do not hold worker threads
+        # forever and exhaust the thread pool under load.
+        httpd.timeout = 30.0
 
         try:
             httpd.serve_forever()

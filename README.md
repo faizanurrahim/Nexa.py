@@ -169,3 +169,123 @@ Explore more Nexa.py features and examples:
 
 [Read Concepts Documentation](concepts.md)
 
+---
+
+## Nexa.py 0.6.0
+
+Version 0.6.0 adds a threaded HTTP server, ASGI support, environment and
+configuration management, middleware, static file serving, centralized
+logging, and CLI diagnostics.
+
+### Threaded Server
+
+`NXserver.run()` now handles concurrent requests using a threaded transport
+from the standard library. A 30-second request timeout prevents hung clients
+from exhausting worker threads.
+
+### ASGI Support
+
+The `ASGIAdaptor` class (from `Nexa.asgi`) wraps a Nexa handler as a
+compliant ASGI 3 application. It supports HTTP scopes, request/response
+events, streaming bodies, lifespan events, async handlers, and disconnect
+propagation. Websocket and HTTP/2 scopes are not supported and raise
+`ASGIError`.
+
+```python
+from Nexa import NXserver, ASGIAdaptor
+
+app = NXserver("MyApp")
+
+@app.get("/")
+def home():
+    return "Hello, ASGI!"
+
+# Use with any ASGI server:
+# asgi_app = ASGIAdaptor(app)
+```
+
+### Environment Management
+
+The `Env` class (from `Nexa.env`) provides project-scoped environment
+management with defaults, type helpers, persistence, OS environment fallback,
+and secret redaction.
+
+```python
+from Nexa import Env
+
+env = Env("myapp")
+env.set("DEBUG", "true", type=bool)
+assert env.get("DEBUG") is True
+```
+
+### Configuration
+
+The `Config` class (from `Nexa.config`) reads TOML files with dotted keys,
+defaults, validation, and environment variable overrides.
+
+```python
+from Nexa import Config
+
+cfg = Config()
+cfg.load("nexa.toml")
+host = cfg.get("server.host", default="127.0.0.1")
+```
+
+### Middleware
+
+The `Middleware` class (from `Nexa.middleware`) provides a composable
+middleware pipeline with deterministic ordering, sync/async support, and the
+`call_next` pattern.
+
+```python
+from Nexa import Middleware
+
+@Middleware.register(priority=10)
+def my_middleware(request, call_next):
+    # Runs before the handler.
+    response = call_next(request)
+    # Runs after the handler.
+    return response
+```
+
+### Static Files
+
+The `StaticFiles` class (from `Nexa.static`) serves files safely with path
+traversal protection, MIME types, cache headers, HEAD support, and
+conditional requests.
+
+```python
+from Nexa import StaticFiles
+
+static = StaticFiles(directory="public")
+response = static.handle_request("GET", "/css/style.css")
+```
+
+### Logging
+
+The `Nexa.log` module provides centralized logging with levels, console/file
+output, structured (JSON) logging, request/exception helpers, and secret
+scrubbing.
+
+```python
+from Nexa import info, error, request
+
+info("Server started")
+error("Something went wrong: %s", exc)
+request("GET /health 200 3ms")
+```
+
+### CLI Diagnostics
+
+```bash
+nexa doctor   # Verify installation and environment.
+nexa info     # Show runtime information.
+```
+
+### Version
+
+```bash
+nexa --version
+# Nexa.py 0.6.0
+```
+

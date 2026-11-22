@@ -12,21 +12,7 @@ class NexaError(Exception):
     """Base error class for Nexa.py."""
 
 
-__version__ = "0.5.2-BETA"
-def __err_fix__(CDE: str):
-    """Get a fix for an error code."""
-    fixes = {
-        "0": "Try running with the --noenv flag.",
-        "1": "The CDE might be invalid. Check it and try again.",
-    }
-
-    fix = fixes.get(CDE)
-
-    if fix is None:
-        raise NexaError(f"ERR : CDE 1 : {CDE}")
-
-    typer.echo(f"FIX FOR CDE {CDE}: {fix}")
-
+__version__ = "0.6.0"
 
 
 app = typer.Typer(
@@ -45,12 +31,95 @@ def get_env():
         sys.path.insert(0, cwd)
 
     try:
-        from .LIB import env
-        return env.__env_setup__()
+        from .env import Env
+        return Env().dump()
     except ModuleNotFoundError as exc:
         raise NexaError(
             f"CDE Env.NEXA ERR"
         ) from exc
+
+
+@app.command()
+def doctor():
+    """Verify the Nexa.py installation and environment."""
+    from .log import info as _log_info
+
+    _log_info("Running Nexa doctor checks...")
+
+    checks: list[tuple[str, bool, str]] = []
+
+    # Python version.
+    py_version = sys.version.split()[0]
+    checks.append(("Python version", True, py_version))
+
+    # Nexa version.
+    checks.append(("Nexa version", True, __version__))
+
+    # Typer availability.
+    try:
+        import typer  # noqa: F401
+        checks.append(("Typer", True, typer.__version__))
+    except ImportError:
+        checks.append(("Typer", False, "not installed"))
+
+    # Writable cache directory.
+    cache_dir = Path.home() / ".nexa" / "cache"
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        test_file = cache_dir / ".doctor_test"
+        test_file.write_text("ok")
+        test_file.unlink()
+        checks.append(("Cache directory", True, str(cache_dir)))
+    except OSError as exc:
+        checks.append(("Cache directory", False, str(exc)))
+
+    # Config file presence.
+    config_path = Path.cwd() / "nexa.toml"
+    if config_path.is_file():
+        checks.append(("Project config", True, str(config_path)))
+    else:
+        checks.append(("Project config", True, "not present (optional)"))
+
+    # Environment file presence.
+    env_path = Path.cwd() / ".env.json"
+    if env_path.is_file():
+        checks.append(("Environment file", True, str(env_path)))
+    else:
+        checks.append(("Environment file", True, "not present (optional)"))
+
+    # Report.
+    all_ok = True
+    for name, ok, detail in checks:
+        status = "OK" if ok else "FAIL"
+        _log_info(f"  [{status}] {name}: {detail}")
+        if not ok:
+            all_ok = False
+
+    if all_ok:
+        _log_info("All checks passed.")
+    else:
+        _log_info("Some checks failed. Review the items above.")
+
+    raise typer.Exit(code=0 if all_ok else 1)
+
+
+@app.command()
+def info():
+    """Show Nexa.py runtime information."""
+    from .log import info as _log_info
+
+    _log_info(f"Nexa.py {__version__}")
+    _log_info(f"Python {sys.version.split()[0]} ({sys.executable})")
+    _log_info(f"Platform: {sys.platform}")
+    _log_info(f"Working directory: {Path.cwd()}")
+
+    # Show loaded commands.
+    _log_info("\nCommands:")
+    for cmd in app.registered_commands:
+        if cmd.name:
+            _log_info(f"  nexa {cmd.name}")
+
+    raise typer.Exit(code=0)
 
 
 @app.callback(invoke_without_command=True)
@@ -91,7 +160,7 @@ def main(
             namespace = {"__name__": "__main__"}
 
             if not noenv:
-                namespace["Mtdata"] = get_env()
+                namespace["Metadata"] = get_env()
 
             exec(compile(code, "<nexa-inline>", "exec"), namespace)
 

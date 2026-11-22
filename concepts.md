@@ -1,5 +1,10 @@
 # Nexa.py Basic Concepts
 
+> Version 0.6.0 adds a threaded HTTP server, ASGI support, environment and
+> configuration management, middleware, static file serving, centralized
+> logging, and CLI diagnostics (`nexa doctor`, `nexa info`).
+
+
 # Concept 1: API Creation
 
 Nexa.py provides the `jsonify()` function for creating JSON responses. Combined with Nexa's routing system, it allows developers to build APIs and handle HTTP requests efficiently.
